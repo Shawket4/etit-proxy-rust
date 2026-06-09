@@ -1,0 +1,4697 @@
+--- FILE: src/cache/singleflight.rs ---
+//! A small single-flight implementation.
+//!
+//! When N concurrent callers ask for the same key, only the first one runs
+//! the closure; the rest wait on the same `Notify` and clone the resulting
+//! value. This is what stops the history endpoint from hammering the
+//! upstream when a dashboard with K vehicles asks for the same day at once.
+//!
+//! Returned values must be `Clone` because all waiters need their own copy.
+
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use tokio::sync::Notify;
+
+enum Slot<V> {
+    InFlight(Arc<Notify>),
+    Done(V),
+}
+
+pub struct SingleFlight<K, V> {
+    inner: Arc<Mutex<HashMap<K, Slot<V>>>>,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> Default for SingleFlight<K, V> {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone + Send + 'static, V: Clone + Send + 'static> SingleFlight<K, V> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run `f()` once per key, in flight; concurrent callers get the same
+    /// result. The map entry is removed once the first call completes
+    /// (success or failure), so the next caller will retry rather than
+    /// keep observing a stale error.
+    pub async fn run<F, Fut, E>(&self, key: K, f: F) -> Result<V, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<V, E>>,
+    {
+        // Phase 1: register or join.
+        let either = {
+            let mut g = self.inner.lock();
+            match g.get(&key) {
+                Some(Slot::InFlight(n)) => Either::Wait(n.clone()),
+                Some(Slot::Done(v))     => Either::Have(v.clone()),
+                None => {
+                    let notify = Arc::new(Notify::new());
+                    g.insert(key.clone(), Slot::InFlight(notify.clone()));
+                    Either::Lead
+                }
+            }
+        };
+
+        match either {
+            Either::Have(v) => Ok(v),
+            Either::Wait(notify) => {
+                notify.notified().await;
+                // Re-check map.
+                let done_val = {
+                    let g = self.inner.lock();
+                    match g.get(&key) {
+                        Some(Slot::Done(v)) => Some(v.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(v) = done_val {
+                    Ok(v)
+                } else {
+                    f().await
+                }
+            }
+            Either::Lead => {
+                let result = f().await;
+                let notify = {
+                    let mut g = self.inner.lock();
+                    match (&result, g.remove(&key)) {
+                        (Ok(v), Some(Slot::InFlight(n))) => {
+                            // Briefly publish the result so any waiter that
+                            // hasn't yet been notified can pick it up.
+                            g.insert(key.clone(), Slot::Done(v.clone()));
+                            n
+                        }
+                        (Ok(_), _) => Arc::new(Notify::new()),
+                        (Err(_), Some(Slot::InFlight(n))) => n,
+                        (Err(_), _) => Arc::new(Notify::new()),
+                    }
+                };
+                notify.notify_waiters();
+
+                // Schedule a tiny grace window before evicting the cached
+                // value so late-arriving waiters see it.
+                let inner = self.inner.clone();
+                let k = key.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    inner.lock().remove(&k);
+                });
+
+                result
+            }
+        }
+    }
+}
+
+enum Either<V> {
+    Lead,
+    Wait(Arc<Notify>),
+    Have(V),
+}
+
+
+--- FILE: src/cache/memory.rs ---
+//! In-memory caches.
+//!
+//! - **Vehicles** — a single `ArcSwap<VehiclesSnapshot>`: lock-free reads,
+//!   atomic full-replacement writes. Refreshed by Tier A poller.
+//! - **Live** — `ArcSwap<LiveSnapshot>`: same shape, fully overwritten
+//!   every Tier B tick.
+//! - **History (hot/cold)** — a single moka `Cache` keyed by
+//!   `(vehicle_id, NaiveDate)`. Hot entries (today/yesterday) and cold ones
+//!   live in the same map; the consumer cares only "do I have it". The
+//!   TTL is set to a sentinel huge value because we expire by *policy*,
+//!   not by elapsed time — Tier C poller overwrites hot rows, and there
+//!   is no automatic eviction for cold rows.
+//!
+//! Design note: the four-tier idea from v1 is preserved, but the
+//! mechanical separation between hot/cold collections is gone. With moka
+//! you don't need it — capacity-based eviction handles cold growth, and
+//! Tier C just rewrites today/yesterday on every tick.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
+use chrono::NaiveDate;
+use chrono_tz::Tz;
+use moka::future::Cache;
+use serde::Serialize;
+
+use crate::domain::history::CachedHistory;
+use crate::domain::{LiveVehicleStatus, Vehicle};
+
+#[derive(Clone, Default, Debug)]
+pub struct VehiclesSnapshot {
+    pub vehicles: Arc<Vec<Vehicle>>,
+    pub fetched_at: Option<Instant>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct LiveSnapshot {
+    pub by_id: Arc<std::collections::HashMap<String, LiveVehicleStatus>>,
+    pub fetched_at: Option<Instant>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub struct HistoryKey {
+    pub vehicle_id: String,
+    pub date: NaiveDate,
+}
+
+pub struct CacheLayer {
+    vehicles: ArcSwap<VehiclesSnapshot>,
+    vehicles_ttl: Duration,
+
+    live: ArcSwap<LiveSnapshot>,
+
+    history: Cache<HistoryKey, Arc<CachedHistory>>,
+
+    pub tz: Tz,
+}
+
+impl CacheLayer {
+    pub fn new(vehicles_ttl: Duration, tz: Tz, history_capacity: u64) -> Arc<Self> {
+        let history = Cache::builder()
+            .max_capacity(history_capacity)
+            // No TTL: Tier C poller overwrites hot rows; cold rows are
+            // capacity-evicted in LRU order under pressure.
+            .build();
+
+        Arc::new(Self {
+            vehicles: ArcSwap::new(Arc::new(VehiclesSnapshot::default())),
+            vehicles_ttl,
+            live: ArcSwap::new(Arc::new(LiveSnapshot::default())),
+            history,
+            tz,
+        })
+    }
+
+    // ---- Vehicles -----------------------------------------------------------
+
+    pub fn vehicles_snapshot(&self) -> VehiclesSnapshot {
+        (**self.vehicles.load()).clone()
+    }
+
+    pub fn vehicles_is_fresh(&self) -> bool {
+        match self.vehicles.load().fetched_at {
+            Some(t) => t.elapsed() < self.vehicles_ttl,
+            None => false,
+        }
+    }
+
+    pub fn store_vehicles(&self, vehicles: Vec<Vehicle>) {
+        self.vehicles.store(Arc::new(VehiclesSnapshot {
+            vehicles: Arc::new(vehicles),
+            fetched_at: Some(Instant::now()),
+        }));
+    }
+
+    // ---- Live ---------------------------------------------------------------
+
+    pub fn live_snapshot(&self) -> LiveSnapshot {
+        (**self.live.load()).clone()
+    }
+
+    /// Replace the live snapshot. Plate join is done here using the current
+    /// vehicles cache; callers don't need to pre-enrich.
+    pub fn store_live(&self, statuses: Vec<LiveVehicleStatus>) {
+        let plates: std::collections::HashMap<String, String> = self
+            .vehicles_snapshot()
+            .vehicles
+            .iter()
+            .map(|v| (v.id.clone(), v.plate.clone()))
+            .collect();
+
+        let map: std::collections::HashMap<String, LiveVehicleStatus> = statuses
+            .into_iter()
+            .map(|mut s| {
+                if s.plate.is_none() {
+                    if let Some(p) = plates.get(&s.id) {
+                        if !p.is_empty() {
+                            s.plate = Some(p.clone());
+                        }
+                    }
+                }
+                (s.id.clone(), s)
+            })
+            .collect();
+
+        self.live.store(Arc::new(LiveSnapshot {
+            by_id: Arc::new(map),
+            fetched_at: Some(Instant::now()),
+        }));
+    }
+
+    // ---- History -----------------------------------------------------------
+
+    pub fn today_local(&self) -> NaiveDate {
+        crate::domain::time::today_local(self.tz)
+    }
+
+    pub fn is_hot_date(&self, date: NaiveDate) -> bool {
+        let today = self.today_local();
+        let yesterday = today.pred_opt().unwrap_or(today);
+        date == today || date == yesterday
+    }
+
+    pub async fn get_history(
+        &self,
+        vehicle_id: &str,
+        date: NaiveDate,
+    ) -> Option<Arc<CachedHistory>> {
+        let key = HistoryKey {
+            vehicle_id: vehicle_id.to_string(),
+            date,
+        };
+        self.history.get(&key).await
+    }
+
+    pub async fn store_history(
+        &self,
+        vehicle_id: &str,
+        date: NaiveDate,
+        history: Arc<CachedHistory>,
+    ) {
+        let key = HistoryKey {
+            vehicle_id: vehicle_id.to_string(),
+            date,
+        };
+        self.history.insert(key, history).await;
+    }
+
+    pub async fn invalidate_all(&self) {
+        self.vehicles.store(Arc::new(VehiclesSnapshot::default()));
+        self.live.store(Arc::new(LiveSnapshot::default()));
+        self.history.invalidate_all();
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        let v = self.vehicles.load();
+        let l = self.live.load();
+        CacheStats {
+            vehicles_count:    v.vehicles.len(),
+            vehicles_age_secs: v.fetched_at.map(|t| t.elapsed().as_secs()),
+            live_count:        l.by_id.len(),
+            live_age_secs:     l.fetched_at.map(|t| t.elapsed().as_secs()),
+            history_entries:   self.history.entry_count(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct CacheStats {
+    pub vehicles_count: usize,
+    pub vehicles_age_secs: Option<u64>,
+    pub live_count: usize,
+    pub live_age_secs: Option<u64>,
+    pub history_entries: u64,
+}
+
+
+--- FILE: src/cache/mod.rs ---
+//! In-memory caching and single-flight coordination.
+
+pub mod memory;
+pub mod singleflight;
+
+pub use memory::{CacheLayer, CacheStats};
+pub use singleflight::SingleFlight;
+
+
+--- FILE: src/auth/claims.rs ---
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Claims {
+    pub user_type: String,
+    pub user_id: Option<i32>,
+    pub driver_id: Option<i32>,
+    pub permission: Option<i32>,
+    pub exp: i64,
+}
+
+impl Claims {
+    pub fn is_admin(&self) -> bool {
+        self.user_type == "admin_user"
+    }
+}
+
+--- FILE: src/auth/mod.rs ---
+pub mod claims;
+pub use claims::Claims;
+
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{header, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use jsonwebtoken::{decode, DecodingKey, Validation};
+
+/// Axum middleware — validates JWT on every request except those that bypass it.
+///
+/// Token lookup order (mirrors the Rust/actix service):
+///   1. `jwt` cookie
+///   2. `Authorization: Bearer <token>` header
+///
+/// On success the validated `Claims` are inserted into request extensions so
+/// any handler downstream can extract them via `Extension<Claims>`.
+pub async fn require_admin(
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .expect("JWT_SECRET must be set");
+
+    // ── 1. Extract raw token ──────────────────────────────────────────────
+    let token = extract_token(&req);
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            return (StatusCode::UNAUTHORIZED, "Not authenticated").into_response();
+        }
+    };
+
+    // ── 2. Decode & verify signature + expiry ────────────────────────────
+    let token_data = decode::<Claims>(
+        &token,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &Validation::default(),
+    );
+
+    let claims = match token_data {
+        Ok(data) => data.claims,
+        Err(err) => {
+            tracing::warn!(error = %err, "JWT validation failed");
+            return (StatusCode::UNAUTHORIZED, "Invalid token").into_response();
+        }
+    };
+
+    // ── 3. Admin gate ────────────────────────────────────────────────────
+    if !claims.is_admin() {
+        tracing::warn!(
+            user_type = %claims.user_type,
+            "Non-admin attempted to access etit-proxy"
+        );
+        return (StatusCode::FORBIDDEN, "Admin access required").into_response();
+    }
+
+    // ── 4. Forward claims to handlers ────────────────────────────────────
+    req.extensions_mut().insert(claims);
+    next.run(req).await
+}
+
+/// Pulls the raw JWT string from either the `jwt` cookie or the
+/// `Authorization: Bearer` header, preferring the cookie.
+fn extract_token(req: &Request<Body>) -> Option<String> {
+    // Cookie first
+    if let Some(cookie_header) = req.headers().get(header::COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for part in cookie_str.split(';') {
+                let part = part.trim();
+                if let Some(value) = part.strip_prefix("jwt=") {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    // Authorization: Bearer fallback
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|t| t.to_string())
+}
+
+--- FILE: src/error.rs ---
+//! Uniform error type. The HTTP layer maps each variant to:
+//!   - a status code,
+//!   - a stable string `code` the frontend can switch on,
+//!   - a human-readable `error` message.
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde_json::json;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("upstream HTTP error: {0}")]
+    Upstream(#[from] reqwest::Error),
+
+    #[error("upstream returned status {status}: {body}")]
+    UpstreamStatus { status: u16, body: String },
+
+    #[error("login flow failed: {0}")]
+    Login(String),
+
+    #[error("session re-login failed after retry")]
+    SessionDead,
+
+    #[error("failed to parse upstream payload: {0}")]
+    Parse(String),
+
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    #[error("admin auth required")]
+    Unauthorized,
+
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("internal error: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+
+impl AppError {
+    pub fn http(&self) -> (StatusCode, &'static str) {
+        use AppError::*;
+        match self {
+            BadRequest(_)              => (StatusCode::BAD_REQUEST,           "BAD_REQUEST"),
+            NotFound(_)                => (StatusCode::NOT_FOUND,             "NOT_FOUND"),
+            Unauthorized               => (StatusCode::UNAUTHORIZED,          "UNAUTHORIZED"),
+            Login(_) | SessionDead     => (StatusCode::BAD_GATEWAY,           "SESSION_DEAD"),
+            UpstreamStatus { .. }      => (StatusCode::BAD_GATEWAY,           "UPSTREAM_FAILED"),
+            Upstream(_)                => (StatusCode::BAD_GATEWAY,           "UPSTREAM_FAILED"),
+            Parse(_)                   => (StatusCode::BAD_GATEWAY,           "UPSTREAM_FAILED"),
+            Db(_) | Internal(_)        => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, code) = self.http();
+
+        // Always log internally with the full chain.
+        tracing::error!(error = %self, code, "request failed");
+
+        // Public message: opaque for internal errors, otherwise the message.
+        let public = match &self {
+            AppError::Db(_) | AppError::Internal(_) => "internal server error".to_string(),
+            AppError::Upstream(_) | AppError::UpstreamStatus { .. } | AppError::Parse(_) => {
+                "upstream request failed".to_string()
+            }
+            AppError::Login(_) | AppError::SessionDead => {
+                "upstream session could not be established".to_string()
+            }
+            other => other.to_string(),
+        };
+
+        let body = Json(json!({
+            "error": public,
+            "code":  code,
+        }));
+        (status, body).into_response()
+    }
+}
+
+pub type AppResult<T> = std::result::Result<T, AppError>;
+
+
+--- FILE: src/config.rs ---
+//! Environment-driven configuration. All knobs flow through `Config`; no
+//! module reads `std::env` directly.
+
+use std::str::FromStr;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use chrono_tz::Tz;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    // ---- Upstream ETIT ------------------------------------------------------
+    /// Base URL for data calls (e.g. https://fms-gps.etit-eg.com)
+    pub etit_data_url: String,
+    /// Base URL for the login flow (e.g. https://etit-fms.etit-eg.com)
+    pub etit_login_url: String,
+    pub etit_username: String,
+    pub etit_password: String,
+
+    // ---- HTTP server --------------------------------------------------------
+    pub bind_addr: String,
+    /// Optional shared secret for `/admin/*`. None ⇒ admin routes disabled.
+    pub admin_token: Option<String>,
+    /// CORS origins; `*` allows any.
+    pub cors_origins: Vec<String>,
+
+    // ---- Persistence --------------------------------------------------------
+    pub database_url: String,
+
+    // ---- Timezone -----------------------------------------------------------
+    pub timezone: Tz,
+
+    // ---- Tiers --------------------------------------------------------------
+    pub tier_a_refresh: Duration,
+    pub tier_b_poll: Duration,
+    pub tier_c_poll: Duration,
+    pub tier_c_concurrency: usize,
+
+    // ---- HTTP client tuning ------------------------------------------------
+    pub upstream_timeout: Duration,
+    pub upstream_retry_max: u32,
+    pub upstream_retry_base: Duration,
+    /// Optional HTTP/HTTPS proxy for all upstream calls.
+    pub upstream_proxy: Option<String>,
+
+    // ---- Logging ------------------------------------------------------------
+    pub log_format_json: bool,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        let _ = dotenvy::dotenv();
+
+        let etit_login_url = trimmed_env("ETIT_LOGIN_URL")?;
+        let etit_data_url  = trimmed_env("ETIT_DATA_URL")?;
+        let etit_username  = required_env("ETIT_USERNAME")?;
+        let etit_password  = required_env("ETIT_PASSWORD")?;
+
+        let bind_addr =
+            std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+        let admin_token = std::env::var("ADMIN_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let cors_origins = std::env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "*".into())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "sqlite://./data/etit.db?mode=rwc".into());
+
+        let tz_name = std::env::var("TIMEZONE").unwrap_or_else(|_| "Africa/Cairo".into());
+        let timezone = Tz::from_str(&tz_name)
+            .map_err(|_| anyhow!("TIMEZONE `{tz_name}` is not a valid IANA zone"))?;
+
+        let tier_a_refresh   = secs_or("TIER_A_REFRESH_SECS",   24 * 60 * 60)?;
+        let tier_b_poll      = secs_or("TIER_B_POLL_SECS",      60)?;
+        let tier_c_poll      = secs_or("TIER_C_POLL_SECS",      30 * 60)?;
+        let tier_c_concurrency = parse_or("TIER_C_CONCURRENCY",  4_usize)?;
+
+        let upstream_timeout    = secs_or("UPSTREAM_TIMEOUT_SECS", 30)?;
+        let upstream_retry_max  = parse_or("UPSTREAM_RETRY_MAX",   3_u32)?;
+        let upstream_retry_base = ms_or("UPSTREAM_RETRY_BASE_MS",  300)?;
+
+        let upstream_proxy = std::env::var("UPSTREAM_PROXY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let log_format_json = std::env::var("LOG_FORMAT")
+            .map(|s| s.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+
+        Ok(Self {
+            etit_data_url,
+            etit_login_url,
+            etit_username,
+            etit_password,
+            bind_addr,
+            admin_token,
+            cors_origins,
+            database_url,
+            timezone,
+            tier_a_refresh,
+            tier_b_poll,
+            tier_c_poll,
+            tier_c_concurrency,
+            upstream_timeout,
+            upstream_retry_max,
+            upstream_retry_base,
+            upstream_proxy,
+            log_format_json,
+        })
+    }
+
+    pub fn admin_enabled(&self) -> bool {
+        self.admin_token.is_some()
+    }
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+fn required_env(key: &str) -> Result<String> {
+    std::env::var(key).with_context(|| format!("{key} must be set"))
+}
+
+fn trimmed_env(key: &str) -> Result<String> {
+    Ok(required_env(key)?.trim_end_matches('/').to_string())
+}
+
+fn secs_or(key: &str, default: u64) -> Result<Duration> {
+    parse_or::<u64>(key, default).map(Duration::from_secs)
+}
+
+fn ms_or(key: &str, default: u64) -> Result<Duration> {
+    parse_or::<u64>(key, default).map(Duration::from_millis)
+}
+
+fn parse_or<T: FromStr>(key: &str, default: T) -> Result<T>
+where
+    <T as FromStr>::Err: std::fmt::Display,
+{
+    match std::env::var(key) {
+        Ok(v) => v
+            .parse::<T>()
+            .map_err(|e| anyhow!("{key} invalid: {e}")),
+        Err(_) => Ok(default),
+    }
+}
+
+
+--- FILE: src/lib.rs ---
+//! etit-proxy — middleware bridging React/Google Maps to legacy ETIT
+//! ASP.NET tracking.
+//!
+//! Module layout (top-down):
+//!
+//! - [`config`]    — env-driven configuration
+//! - [`error`]     — uniform error type and HTTP mapping
+//! - [`domain`]    — pure data types the rest of the system passes around
+//! - [`upstream`]  — auth, scraping, and parsing for the legacy ETIT system
+//! - [`cache`]     — moka-backed in-memory tiers + single-flight
+//! - [`db`]        — sqlx persistence (vehicles + history)
+//! - [`services`]  — orchestration: cache → DB → upstream lookups
+//! - [`pollers`]   — background workers that warm the caches
+//! - [`api`]       — axum router, handlers, middleware, SSE
+//! - [`state`]     — shared `AppState` glued together at startup
+
+pub mod api;
+pub mod cache;
+pub mod config;
+pub mod db;
+pub mod domain;
+pub mod error;
+pub mod pollers;
+pub mod services;
+pub mod state;
+pub mod upstream;
+pub mod auth;
+
+
+--- FILE: src/state.rs ---
+//! Shared application state plumbed into every handler.
+//!
+//! Everything in here is wrapped in `Arc` (or is `Clone`-cheap) so the
+//! state can be cloned per-request without copying real data.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::cache::CacheLayer;
+use crate::config::Config;
+use crate::services::broadcaster::Broadcaster;
+use crate::services::history::HistoryService;
+use crate::services::live::LiveService;
+use crate::services::vehicles::VehiclesService;
+use crate::upstream::EtitClient;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub cfg: Config,
+    pub client: Arc<EtitClient>,
+    pub cache: Arc<CacheLayer>,
+    pub vehicles: Arc<VehiclesService>,
+    pub live: Arc<LiveService>,
+    pub history: Arc<HistoryService>,
+    pub broadcaster: Arc<Broadcaster>,
+    pub started_at: Instant,
+}
+
+
+--- FILE: src/db/mod.rs ---
+//! SQLite persistence via sqlx.
+//!
+//! Schema lives in `migrations/`. We run them at startup with
+//! `sqlx::migrate!`, so the binary owns its own DB lifecycle — no separate
+//! migration step required for ops.
+
+use anyhow::{Context, Result};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::SqlitePool;
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
+
+pub mod history;
+pub mod vehicles;
+
+pub use history::HistoryRepo;
+pub use vehicles::VehiclesRepo;
+
+pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {
+    // For sqlite:// URLs, ensure the parent directory exists so SQLite
+    // doesn't error out trying to create the file.
+    if let Some(path) = database_url.strip_prefix("sqlite://") {
+        let path = path.split('?').next().unwrap_or(path);
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating db dir {parent:?}"))?;
+            }
+        }
+    }
+
+    let opts = SqliteConnectOptions::from_str(database_url)
+        .with_context(|| format!("parsing DATABASE_URL `{database_url}`"))?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(opts)
+        .await
+        .context("opening SQLite pool")?;
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .context("running migrations")?;
+
+    tracing::info!("SQLite pool ready, migrations applied");
+    Ok(pool)
+}
+
+
+--- FILE: src/db/history.rs ---
+//! History persistence.
+//!
+//! A row per `(vehicle_id, day_local)` carries:
+//!   - `points_json`  — serialized `Vec<HistoryPoint>`
+//!   - `geometry`     — precomputed polyline (avoid recompute per read)
+//!   - `is_hot`       — 1 if today/yesterday at write time, else 0
+//!
+//! Reads are cheap enough that we don't bother with a per-day blob format;
+//! `points_json` is stored verbatim.
+
+use anyhow::Result;
+use chrono::NaiveDate;
+use sqlx::SqlitePool;
+
+use crate::domain::history::{encode_polyline, CachedHistory};
+use crate::domain::time::utc_now;
+use crate::domain::HistoryPoint;
+
+#[derive(Clone)]
+pub struct HistoryRepo {
+    pool: SqlitePool,
+}
+
+impl HistoryRepo {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Look up cached points for a (vehicle, day). Returns `None` if absent.
+    pub async fn get(
+        &self,
+        vehicle_id: &str,
+        date: NaiveDate,
+    ) -> Result<Option<CachedHistory>> {
+        let date_str = date.format("%Y-%m-%d").to_string();
+        let row: Option<HistoryRow> = sqlx::query_as::<_, HistoryRow>(
+            r#"
+            SELECT vehicle_id, day_local, fetched_at, points_json, geometry, stops_json, sensors_json
+              FROM history_days
+             WHERE vehicle_id = ? AND day_local = ?
+            "#,
+        )
+        .bind(vehicle_id)
+        .bind(date_str)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(r) = row else { return Ok(None) };
+
+        let points: Vec<HistoryPoint> =
+            serde_json::from_str(&r.points_json).unwrap_or_default();
+        
+        let stops = serde_json::from_str(&r.stops_json).unwrap_or_default();
+        let sensors = serde_json::from_str(&r.sensors_json).unwrap_or_default();
+
+        let fetched_at = chrono::DateTime::parse_from_rfc3339(&r.fetched_at)
+            .map(|d| d.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| utc_now());
+
+        Ok(Some(CachedHistory {
+            points,
+            stops,
+            sensors,
+            geometry: r.geometry,
+            fetched_at,
+        }))
+    }
+
+    /// Upsert a day. `is_hot` is set to `1` for today/yesterday rows so the
+    /// poller knows which entries it should rewrite each tick.
+    pub async fn upsert(
+        &self,
+        vehicle_id: &str,
+        date: NaiveDate,
+        data: &CachedHistory,
+        is_hot: bool,
+    ) -> Result<()> {
+        let date_str   = date.format("%Y-%m-%d").to_string();
+        let now        = utc_now().to_rfc3339();
+        let geometry   = encode_polyline(&data.points);
+        let points_str = serde_json::to_string(&data.points).unwrap_or_else(|_| "[]".into());
+        let stops_str  = serde_json::to_string(&data.stops).unwrap_or_else(|_| "[]".into());
+        let sensors_str = serde_json::to_string(&data.sensors).unwrap_or_else(|_| "[]".into());
+
+        sqlx::query(
+            r#"
+            INSERT INTO history_days
+                (vehicle_id, day_local, fetched_at, point_count, points_json, geometry, stops_json, sensors_json, is_hot)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(vehicle_id, day_local) DO UPDATE SET
+                fetched_at   = excluded.fetched_at,
+                point_count  = excluded.point_count,
+                points_json  = excluded.points_json,
+                geometry     = excluded.geometry,
+                stops_json   = excluded.stops_json,
+                sensors_json = excluded.sensors_json,
+                is_hot       = excluded.is_hot
+            "#,
+        )
+        .bind(vehicle_id)
+        .bind(date_str)
+        .bind(now)
+        .bind(data.points.len() as i64)
+        .bind(points_str)
+        .bind(geometry)
+        .bind(stops_str)
+        .bind(sensors_str)
+        .bind(if is_hot { 1_i64 } else { 0_i64 })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Flip any hot rows that are no longer today/yesterday to cold. Run on
+    /// each Tier C tick before refreshing.
+    pub async fn cool_aged_hot_rows(&self, today: NaiveDate, yesterday: NaiveDate) -> Result<u64> {
+        let res = sqlx::query(
+            r#"
+            UPDATE history_days
+               SET is_hot = 0
+             WHERE is_hot = 1
+               AND day_local NOT IN (?, ?)
+            "#,
+        )
+        .bind(today.format("%Y-%m-%d").to_string())
+        .bind(yesterday.format("%Y-%m-%d").to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn count(&self) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM history_days").fetch_one(&self.pool).await?;
+        Ok(n)
+    }
+
+    /// Wipe all history (used by `POST /admin/cache/invalidate { all }`).
+    pub async fn truncate(&self) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM history_days").execute(&self.pool).await?;
+        Ok(res.rows_affected())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct HistoryRow {
+    #[allow(dead_code)] vehicle_id: String,
+    #[allow(dead_code)] day_local:  String,
+    fetched_at:   String,
+    points_json:  String,
+    geometry:     String,
+    stops_json:   String,
+    sensors_json: String,
+}
+
+
+--- FILE: src/db/vehicles.rs ---
+//! Vehicles persistence. We snapshot the entire vehicle list every Tier A
+//! tick. Reads are used solely to seed the in-memory cache on cold start —
+//! the live system always rebuilds from upstream within seconds anyway.
+
+use anyhow::Result;
+use sqlx::SqlitePool;
+
+use crate::domain::time::{utc_now, Timestamp};
+use crate::domain::Vehicle;
+
+pub struct VehiclesRepo {
+    pool: SqlitePool,
+}
+
+impl VehiclesRepo {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Replace the entire snapshot in a single transaction. Faster than per-row
+    /// upsert for the typical 50–500 row table.
+    pub async fn replace_all(&self, vehicles: &[Vehicle]) -> Result<()> {
+        let now = utc_now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM vehicles").execute(&mut *tx).await?;
+
+        for v in vehicles {
+            let extra = serde_json::to_string(&v.extra).unwrap_or_else(|_| "{}".into());
+            let last_iso = v.last_location_at.map(|t| t.to_rfc3339());
+
+            sqlx::query(
+                r#"
+                INSERT INTO vehicles (
+                    id, codename, plate, speed_limit, online, speed,
+                    status, status_label, last_location_at, extra_json, refreshed_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                "#,
+            )
+            .bind(&v.id)
+            .bind(&v.codename)
+            .bind(&v.plate)
+            .bind(v.speed_limit as i64)
+            .bind(if v.online { 1_i64 } else { 0_i64 })
+            .bind(v.speed as i64)
+            .bind(v.status as i64)
+            .bind(&v.status_label)
+            .bind(last_iso)
+            .bind(extra)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn load_all(&self) -> Result<Vec<Vehicle>> {
+        let rows = sqlx::query_as::<_, VehicleRow>(
+            r#"
+            SELECT id, codename, plate, speed_limit, online, speed,
+                   status, status_label, last_location_at, extra_json
+              FROM vehicles
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(VehicleRow::into_domain).collect())
+    }
+
+    pub async fn count(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vehicles")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct VehicleRow {
+    id: String,
+    codename: String,
+    plate: String,
+    speed_limit: i64,
+    online: i64,
+    speed: i64,
+    status: i64,
+    status_label: String,
+    last_location_at: Option<String>,
+    extra_json: String,
+}
+
+impl VehicleRow {
+    fn into_domain(self) -> Vehicle {
+        let last_location_at: Option<Timestamp> = self
+            .last_location_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+
+        let extra: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&self.extra_json).unwrap_or_default();
+
+        Vehicle {
+            id: self.id,
+            codename: self.codename,
+            plate: self.plate,
+            speed_limit: self.speed_limit.max(0) as u32,
+            online: self.online != 0,
+            speed: self.speed.max(0) as u32,
+            status: self.status as i32,
+            status_label: self.status_label,
+            last_location_at,
+            extra,
+        }
+    }
+}
+
+
+--- FILE: src/main.rs ---
+//! etit-proxy binary entry point.
+//!
+//! Cold-start sequence:
+//!   1. Initialize tracing (json or pretty per `LOG_FORMAT`).
+//!   2. Load config from environment.
+//!   3. Open the SQLite pool and run migrations.
+//!   4. Build the upstream client.
+//!   5. Build the cache, services, broadcaster.
+//!   6. Seed the in-memory vehicle cache from SQLite (no upstream call yet).
+//!   7. Attempt the first ETIT login. *Failure here is non-fatal* — the
+//!      pollers will retry. We must still bind the port so K8s/systemd
+//!      readiness probes succeed.
+//!   8. Spawn pollers.
+//!   9. Build the router with CORS / compression / tracing / request-id.
+//!  10. Serve until SIGINT/SIGTERM.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::Context;
+use axum::http::{HeaderName, HeaderValue, Method};
+use axum::routing::get;
+use tokio::net::TcpListener;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+use etit_proxy::api;
+use etit_proxy::auth::require_admin;
+use etit_proxy::cache::CacheLayer;
+use etit_proxy::config::Config;
+use etit_proxy::db::{open_pool, HistoryRepo, VehiclesRepo};
+use etit_proxy::pollers::Pollers;
+use etit_proxy::services::broadcaster::Broadcaster;
+use etit_proxy::services::history::HistoryService;
+use etit_proxy::services::live::LiveService;
+use etit_proxy::services::vehicles::VehiclesService;
+use etit_proxy::state::AppState;
+use etit_proxy::upstream::EtitClient;
+
+/// Default capacity for the live broadcast channel.
+const BROADCAST_CAPACITY: usize = 64;
+
+/// Default capacity for the moka history cache.
+const HISTORY_CACHE_DEFAULT_CAPACITY: u64 = 4_096;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cfg = Config::from_env().context("loading configuration")?;
+    install_tracing(cfg.log_format_json);
+
+    tracing::info!(
+        bind      = %cfg.bind_addr,
+        data_url  = %cfg.etit_data_url,
+        login_url = %cfg.etit_login_url,
+        tz        = %cfg.timezone,
+        version   = env!("CARGO_PKG_VERSION"),
+        "starting etit-proxy",
+    );
+
+    // ---- Persistence --------------------------------------------------------
+    let pool = open_pool(&cfg.database_url).await?;
+    let vehicles_repo = VehiclesRepo::new(pool.clone());
+
+    // ---- Upstream client ---------------------------------------------------
+    let client = EtitClient::new(cfg.clone()).context("building EtitClient")?;
+
+    // ---- In-memory cache ---------------------------------------------------
+    let history_capacity = std::env::var("HISTORY_CACHE_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(HISTORY_CACHE_DEFAULT_CAPACITY);
+    let cache = CacheLayer::new(cfg.tier_a_refresh, cfg.timezone, history_capacity);
+
+    // ---- Services ----------------------------------------------------------
+    let vehicles_svc = Arc::new(VehiclesService {
+        client: client.clone(),
+        cache:  cache.clone(),
+        repo:   VehiclesRepo::new(pool.clone()),
+    });
+
+    let live_svc = Arc::new(LiveService {
+        client:   client.clone(),
+        cache:    cache.clone(),
+        vehicles: vehicles_svc.clone(),
+    });
+
+    let history_svc = Arc::new(HistoryService::new(
+        client.clone(),
+        cache.clone(),
+        HistoryRepo::new(pool.clone()),
+    ));
+
+    let broadcaster = Broadcaster::new(BROADCAST_CAPACITY);
+
+    // ---- Seed in-memory vehicle cache from disk ----------------------------
+    match vehicles_repo.load_all().await {
+        Ok(vs) if !vs.is_empty() => {
+            tracing::info!(count = vs.len(), "seeded vehicle cache from SQLite");
+            cache.store_vehicles(vs);
+        }
+        Ok(_) => {
+            tracing::info!("no persisted vehicles; will populate on first Tier A refresh");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not seed vehicles from disk");
+        }
+    }
+
+    // ---- Initial login (best-effort) --------------------------------------
+    if let Err(e) = client.force_login().await {
+        tracing::warn!(error = %e, "initial ETIT login failed; pollers will retry");
+    }
+
+    // ---- App state --------------------------------------------------------
+    let state = AppState {
+        cfg:         cfg.clone(),
+        client:      client.clone(),
+        cache:       cache.clone(),
+        vehicles:    vehicles_svc.clone(),
+        live:        live_svc.clone(),
+        history:     history_svc.clone(),
+        broadcaster: broadcaster.clone(),
+        started_at:  Instant::now(),
+    };
+
+    // ---- Pollers ----------------------------------------------------------
+    Arc::new(Pollers {
+        cfg:          cfg.clone(),
+        vehicles:     vehicles_svc.clone(),
+        live:         live_svc.clone(),
+        history:      history_svc.clone(),
+        history_repo: HistoryRepo::new(pool.clone()),
+        broadcaster:  broadcaster.clone(),
+    })
+    .spawn_all();
+
+    // ---- CORS -------------------------------------------------------------
+    //
+    // `withCredentials: true` on the browser side requires three things from
+    // the server — all three must hold simultaneously or the browser blocks:
+    //
+    //   1. Access-Control-Allow-Origin must be a single explicit origin,
+    //      never "*". The browser refuses credentialed requests to a wildcard.
+    //
+    //   2. Access-Control-Allow-Credentials: true must be present on both
+    //      the preflight (OPTIONS) and the actual response.
+    //
+    //   3. Every header the browser sends in the real request must appear in
+    //      Access-Control-Allow-Headers on the preflight — including
+    //      Authorization, which is *not* a CORS-safelisted header.
+    //
+    // CORS_ALLOWED_ORIGIN defaults to the production frontend. Override in
+    // .env for local dev, e.g.:
+    //   CORS_ALLOWED_ORIGIN=http://localhost:5173
+    let allowed_origin = std::env::var("CORS_ALLOWED_ORIGIN")
+        .unwrap_or_else(|_| "https://apextransport.ddns.net".to_string());
+
+    let origin_value = HeaderValue::from_str(&allowed_origin)
+        .with_context(|| format!("invalid CORS_ALLOWED_ORIGIN: {allowed_origin}"))?;
+
+    tracing::info!(origin = %allowed_origin, "CORS allowed origin");
+
+    let cors = CorsLayer::new()
+        // Exact origin — required when allow_credentials is true.
+        .allow_origin(AllowOrigin::exact(origin_value))
+        // Allow-Credentials: true so the browser forwards cookies / auth
+        // headers and exposes the response to JS.
+        .allow_credentials(true)
+        .allow_methods(AllowMethods::list([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::OPTIONS,
+        ]))
+        // List every request header the frontend will send. Authorization is
+        // non-safelisted and *must* be here or the preflight is rejected.
+        .allow_headers(AllowHeaders::list([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("accept"),
+            HeaderName::from_static("x-request-id"),
+        ]))
+        // Expose response headers that frontend JS needs to read.
+        .expose_headers(ExposeHeaders::list([
+            HeaderName::from_static("x-request-id"),
+        ]))
+        // Cache the preflight for 2 hours — reduces OPTIONS round-trips.
+        .max_age(std::time::Duration::from_secs(7_200));
+
+    // ---- Server -----------------------------------------------------------
+    //
+    // Route structure:
+    //
+    //   /health  — unauthenticated, for systemd / nginx / external monitors.
+    //
+    //   /*       — everything else is behind `require_admin`. The middleware
+    //              validates the JWT (cookie or Bearer header), checks the
+    //              user_type == "admin_user" claim, and returns 401/403 before
+    //              any handler logic runs.
+    //
+    // `route_layer` applies the middleware only to the routes it wraps, so
+    // /health is genuinely excluded — not just skipped inside the middleware.
+    //
+    // CORS is the outermost layer so preflight OPTIONS requests are answered
+    // before auth runs. Browsers send preflights without credentials, so
+    // letting auth see them would cause every preflight to 401.
+    let protected = api::router(state)
+        .route_layer(axum::middleware::from_fn(require_admin));
+
+    let app = axum::Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(protected)
+        .layer(cors);
+
+    let listener = TcpListener::bind(&cfg.bind_addr)
+        .await
+        .with_context(|| format!("binding {}", cfg.bind_addr))?;
+
+    tracing::info!(addr = %cfg.bind_addr, "listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("server error")?;
+
+    tracing::info!("shutdown complete");
+    Ok(())
+}
+
+fn install_tracing(json: bool) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,etit_proxy=debug,tower_http=info"));
+
+    let registry = tracing_subscriber::registry().with(filter);
+    if json {
+        registry.with(fmt::layer().json().with_target(false)).init();
+    } else {
+        registry.with(fmt::layer().with_target(false)).init();
+    }
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut s) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c    => tracing::info!("ctrl-c received; shutting down"),
+        _ = terminate => tracing::info!("SIGTERM received; shutting down"),
+    }
+}
+
+--- FILE: src/api/mod.rs ---
+//! HTTP API.
+//!
+//! All public endpoints live under `/api/v1/*`. Anything else
+//! (`/healthz`, `/metrics`, `/admin/*`) is operational and explicitly
+//! versionless — its contract is implementation-defined and subject to
+//! change without notice.
+
+pub mod dto;
+pub mod handlers;
+pub mod middleware;
+
+use std::str::FromStr;
+
+use axum::http::{header, HeaderName, HeaderValue, Method};
+use axum::middleware::from_fn_with_state;
+use axum::routing::{get, post};
+use axum::Router;
+use tower_http::compression::CompressionLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
+use tower_http::trace::TraceLayer;
+
+use crate::state::AppState;
+
+pub fn router(state: AppState) -> Router {
+    let cors = build_cors(&state);
+
+    // API v1 — stable contract.
+    let v1 = Router::new()
+        .route("/vehicles",                get(handlers::vehicles::list))
+        .route("/vehicles/live",           get(handlers::live::list))
+        .route("/vehicles/:id",            get(handlers::vehicles::get_one))
+        .route("/vehicles/:id/live",       get(handlers::live::get_one))
+        .route("/vehicles/:id/history",         get(handlers::history::for_vehicle))
+        .route("/vehicles/:id/history/summary", get(handlers::history::summary))
+        .route("/stream/live",                  get(handlers::stream::live_sse));
+
+    // Admin — gated by token. If admin is disabled, the middleware short-
+    // circuits with a 404 so the surface area is invisible.
+    let admin_state = state.clone();
+    let admin = Router::new()
+        .route("/cache/invalidate", post(handlers::admin::invalidate))
+        .route("/auth/relogin",     post(handlers::admin::relogin))
+        .layer(from_fn_with_state(admin_state, middleware::admin_guard));
+
+    Router::new()
+        .nest("/api/v1", v1)
+        .nest("/admin",  admin)
+        .route("/healthz", get(handlers::health::healthz))
+        .route("/metrics", get(handlers::metrics::metrics))
+        .with_state(state)
+        // Apply layers from outermost-in. `request_id` runs last so it can
+        // tag every log line that follows.
+        .layer(cors)
+        .layer(CompressionLayer::new())
+        .layer(no_store_for_api())
+        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(middleware::request_id))
+}
+
+/// Sends `Cache-Control: no-store` on every response, which is what we want
+/// for an API: caches must never serve stale snapshots back to a browser.
+fn no_store_for_api() -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-store"),
+    )
+}
+
+fn build_cors(state: &AppState) -> CorsLayer {
+    let allow_origin = if state.cfg.cors_origins.iter().any(|s| s == "*") {
+        AllowOrigin::any()
+    } else {
+        let origins: Vec<HeaderValue> = state
+            .cfg
+            .cors_origins
+            .iter()
+            .filter_map(|s| HeaderValue::from_str(s).ok())
+            .collect();
+        if origins.is_empty() {
+            AllowOrigin::any()
+        } else {
+            AllowOrigin::list(origins)
+        }
+    };
+
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HeaderName::from_str("x-admin-token").unwrap(),
+        ])
+}
+
+
+--- FILE: src/api/middleware.rs ---
+//! Middleware for the API.
+//!
+//! - **Request ID** — generates or propagates a UUID and echoes it on the
+//!   response. The id is also placed in a tracing span so every log line
+//!   under that request carries it.
+//! - **Admin guard** — if `cfg.admin_token` is unset, all `/admin/*` routes
+//!   are 404'd. Otherwise they require an `X-Admin-Token` header that
+//!   matches the configured value.
+
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde_json::json;
+use uuid::Uuid;
+
+use crate::state::AppState;
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
+const ADMIN_HEADER: &str = "x-admin-token";
+
+/// Generates `X-Request-Id` if missing, attaches it to the request
+/// extensions for downstream code to read, and echoes it on the response.
+pub async fn request_id(mut req: axum::extract::Request, next: Next) -> Response {
+    let id = req
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    if let Ok(hv) = HeaderValue::from_str(&id) {
+        req.headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), hv.clone());
+        let _ = req.extensions_mut().insert(RequestId(id.clone()));
+        let span = tracing::info_span!("req", id = %id);
+        let _entered = span.enter();
+        let mut resp = next.run(req).await;
+        resp.headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), hv);
+        return resp;
+    }
+    next.run(req).await
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestId(pub String);
+
+pub async fn admin_guard(
+    State(s): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = s.cfg.admin_token.as_deref() else {
+        // Admin disabled entirely.
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    };
+    let provided = req
+        .headers()
+        .get(ADMIN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided.is_empty() || !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "admin token required", "code": "UNAUTHORIZED"})),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// Constant-time byte comparison. Length mismatch short-circuits to false.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Helper for handlers that want to read the request id from a [`HeaderMap`].
+#[allow(dead_code)]
+pub fn extract_request_id(headers: &HeaderMap) -> Option<&str> {
+    headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
+}
+
+
+--- FILE: src/api/dto.rs ---
+//! Tiny request/response DTOs that don't fit naturally on the domain types.
+//!
+//! Everything here is API-shape only. Domain types live in `crate::domain`.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    /// `YYYY-MM-DD` in the configured timezone. Mutually exclusive with
+    /// `from`/`to`.
+    pub date: Option<String>,
+    /// `YYYY-MM-DDTHH:MM:SS` (configured-tz local) or full RFC3339.
+    pub from: Option<String>,
+    pub to: Option<String>,
+    /// If true, bypass cache and force a fresh fetch from upstream.
+    pub refresh: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InvalidateRequest {
+    /// One of: "all", "vehicles", "live", "history".
+    pub scope: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvalidateResponse {
+    pub scope: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReloginResponse {
+    pub ok: bool,
+    pub epoch: u64,
+}
+
+
+--- FILE: src/api/handlers/stream.rs ---
+//! Server-Sent Events stream of live vehicle status.
+//!
+//! Protocol:
+//!   - On connect: a single `snapshot` event with the current `LiveSnapshot`
+//!     (so clients render immediately without waiting up to a minute).
+//!   - On every Tier B refresh: an `update` event carrying the new
+//!     snapshot. Lagging clients (slow networks etc.) drop the oldest
+//!     events but never block the publisher.
+//!   - Every 30s while idle: a `ping` comment to keep middleboxes from
+//!     killing the TCP connection.
+//!
+//! Clients should reconnect on close — `EventSource` does this automatically.
+
+use std::convert::Infallible;
+use std::time::Duration;
+
+use axum::extract::State;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::stream::{self, Stream, StreamExt};
+use serde::Serialize;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+
+use crate::cache::memory::LiveSnapshot;
+use crate::domain::LiveVehicleStatus;
+use crate::services::broadcaster::LiveEvent;
+use crate::state::AppState;
+
+/// `GET /api/v1/stream/live`
+pub async fn live_sse(
+    State(s): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    // Initial event: current snapshot from the cache. We always emit *some*
+    // snapshot — empty arrays are a valid "no data yet" state.
+    let snap = s.cache.live_snapshot();
+    let initial = make_event("snapshot", &snapshot_to_payload(&snap))
+        .unwrap_or_else(|_| Event::default().event("snapshot").data("[]"));
+    let initial_stream = stream::once(async move { Ok(initial) });
+
+    // Subsequent updates: subscribe to the broadcaster.
+    let rx = s.broadcaster.subscribe();
+    let updates = BroadcastStream::new(rx).filter_map(|res| async move {
+        match res {
+            Ok(LiveEvent::Update(snap)) => {
+                Some(Ok(make_event("update", &snapshot_to_payload(&snap)).unwrap_or_else(|_| {
+                    Event::default().event("update").data("[]")
+                })))
+            }
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                // Inform the client they missed `n` events.
+                let payload = serde_json::json!({"missed": n});
+                Some(Ok(make_event("lag", &payload).unwrap_or_else(|_| {
+                    Event::default().event("lag").data("{}")
+                })))
+            }
+        }
+    });
+
+    let body = initial_stream.chain(updates);
+
+    Sse::new(body).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(30))
+            .text("ping"),
+    )
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LivePayload<'a> {
+    /// The full vehicle list, sorted by id for stable React diffing.
+    vehicles: Vec<&'a LiveVehicleStatus>,
+    /// Number of vehicles in this snapshot.
+    count: usize,
+}
+
+fn snapshot_to_payload(snap: &LiveSnapshot) -> serde_json::Value {
+    let mut sorted: Vec<&LiveVehicleStatus> = snap.by_id.values().collect();
+    sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let payload = LivePayload {
+        count: sorted.len(),
+        vehicles: sorted,
+    };
+    serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null)
+}
+
+fn make_event(name: &str, payload: &serde_json::Value) -> Result<Event, serde_json::Error> {
+    let data = serde_json::to_string(payload)?;
+    Ok(Event::default().event(name).data(data))
+}
+
+
+--- FILE: src/api/handlers/health.rs ---
+//! `/healthz` — operational endpoint.
+
+use axum::extract::State;
+use axum::Json;
+use serde::Serialize;
+
+use crate::cache::CacheStats;
+use crate::state::AppState;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub version: &'static str,
+    pub uptime_secs: u64,
+    pub auth_ready: bool,
+    pub auth_epoch: u64,
+    pub last_login_at: Option<crate::domain::Timestamp>,
+    pub cache: CacheStats,
+    pub sse_subscribers: usize,
+}
+
+pub async fn healthz(State(s): State<AppState>) -> Json<HealthResponse> {
+    let auth = s.client.auth_snapshot().await;
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: s.started_at.elapsed().as_secs(),
+        auth_ready: auth.is_ready(),
+        auth_epoch: auth.epoch,
+        last_login_at: auth.last_login_at,
+        cache: s.cache.stats(),
+        sse_subscribers: s.broadcaster.subscriber_count(),
+    })
+}
+
+
+--- FILE: src/api/handlers/metrics.rs ---
+//! `/metrics` — JSON metrics dump.
+//!
+//! Deliberately not Prometheus-formatted; pulled into ops dashboards via
+//! straight HTTP fetch. If you want Prometheus output, scrape this and
+//! convert downstream.
+
+use axum::extract::State;
+use axum::Json;
+use serde::Serialize;
+
+use crate::cache::CacheStats;
+use crate::state::AppState;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetricsResponse {
+    pub uptime_secs: u64,
+    pub cache: CacheStats,
+    pub auth_epoch: u64,
+    pub auth_ready: bool,
+    pub sse_subscribers: usize,
+    pub config: ConfigMirror,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigMirror {
+    pub timezone: String,
+    pub tier_a_refresh_secs: u64,
+    pub tier_b_poll_secs: u64,
+    pub tier_c_poll_secs: u64,
+    pub tier_c_concurrency: usize,
+    pub upstream_timeout_secs: u64,
+    pub upstream_retry_max: u32,
+    pub admin_enabled: bool,
+}
+
+pub async fn metrics(State(s): State<AppState>) -> Json<MetricsResponse> {
+    let auth = s.client.auth_snapshot().await;
+    Json(MetricsResponse {
+        uptime_secs: s.started_at.elapsed().as_secs(),
+        cache: s.cache.stats(),
+        auth_epoch: auth.epoch,
+        auth_ready: auth.is_ready(),
+        sse_subscribers: s.broadcaster.subscriber_count(),
+        config: ConfigMirror {
+            timezone: s.cfg.timezone.to_string(),
+            tier_a_refresh_secs: s.cfg.tier_a_refresh.as_secs(),
+            tier_b_poll_secs:    s.cfg.tier_b_poll.as_secs(),
+            tier_c_poll_secs:    s.cfg.tier_c_poll.as_secs(),
+            tier_c_concurrency:  s.cfg.tier_c_concurrency,
+            upstream_timeout_secs: s.cfg.upstream_timeout.as_secs(),
+            upstream_retry_max:  s.cfg.upstream_retry_max,
+            admin_enabled:       s.cfg.admin_enabled(),
+        },
+    })
+}
+
+
+--- FILE: src/api/handlers/mod.rs ---
+//! Request handlers, organized by resource.
+
+pub mod admin;
+pub mod health;
+pub mod history;
+pub mod live;
+pub mod metrics;
+pub mod stream;
+pub mod vehicles;
+
+
+--- FILE: src/api/handlers/history.rs ---
+//! `/api/v1/vehicles/:id/history` handler.
+
+use axum::extract::{Path, Query, State};
+use axum::Json;
+use chrono::NaiveDate;
+
+use crate::api::dto::HistoryQuery;
+use crate::domain::history::HistoryResponse;
+use crate::error::{AppError, AppResult};
+use crate::state::AppState;
+
+/// `GET /api/v1/vehicles/:id/history?date=YYYY-MM-DD`  
+/// `GET /api/v1/vehicles/:id/history?from=...&to=...`
+///
+/// Without any query parameters, defaults to **today** in the configured
+/// timezone. `date` and `from`/`to` are mutually exclusive: providing both
+/// is a `BAD_REQUEST`.
+pub async fn for_vehicle(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> AppResult<Json<HistoryResponse>> {
+    if id.is_empty() {
+        return Err(AppError::BadRequest("vehicle id required".into()));
+    }
+
+    let force = q.refresh.unwrap_or(false);
+
+    match (q.date.as_deref(), q.from.as_deref(), q.to.as_deref()) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(AppError::BadRequest(
+            "use either `date` OR `from`+`to`, not both".into(),
+        )),
+        (_, Some(f), Some(t)) => Ok(Json(s.history.for_range(&id, f, t, force).await?)),
+        (_, Some(_), None) | (_, None, Some(_)) => Err(AppError::BadRequest(
+            "`from` and `to` must be provided together".into(),
+        )),
+        (Some(d), _, _) => {
+            let date = NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").map_err(|e| {
+                AppError::BadRequest(format!("invalid `date` (YYYY-MM-DD): {e}"))
+            })?;
+            Ok(Json(s.history.for_day(&id, date, force).await?))
+        }
+        (None, None, None) => {
+            let today = s.cache.today_local();
+            Ok(Json(s.history.for_day(&id, today, force).await?))
+        }
+    }
+}
+
+/// `GET /api/v1/vehicles/:id/history/summary?from=...&to=...`
+pub async fn summary(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<HistoryQuery>,
+) -> AppResult<Json<crate::domain::history::TripSummary>> {
+    let (from, to) = match (q.date.as_deref(), q.from.as_deref(), q.to.as_deref()) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "use either `date` OR `from`+`to`, not both".into(),
+            ))
+        }
+        (_, Some(f), Some(t)) => (f.to_string(), t.to_string()),
+        (_, Some(_), None) | (_, None, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "`from` and `to` must be provided together".into(),
+            ))
+        }
+        (Some(d), _, _) => {
+            // date shortcut -> full day range
+            let from = format!("{d} 00:00:00");
+            let to = format!("{d} 23:59:59");
+            (from, to)
+        }
+        (None, None, None) => {
+            let today = s.cache.today_local();
+            let from = today.format("%Y-%m-%d 00:00:00").to_string();
+            let to = today.format("%Y-%m-%d 23:59:59").to_string();
+            (from, to)
+        }
+    };
+
+    Ok(Json(s.history.get_trip_summary(&id, &from, &to).await?))
+}
+
+
+--- FILE: src/api/handlers/live.rs ---
+//! `/api/v1/vehicles/live` and `/api/v1/vehicles/:id/live` handlers.
+
+use axum::extract::{Path, State};
+use axum::Json;
+
+use crate::domain::LiveVehicleStatus;
+use crate::error::{AppError, AppResult};
+use crate::state::AppState;
+
+/// `GET /api/v1/vehicles/live`
+pub async fn list(State(s): State<AppState>) -> AppResult<Json<Vec<LiveVehicleStatus>>> {
+    Ok(Json(s.live.list().await?))
+}
+
+/// `GET /api/v1/vehicles/:id/live`
+pub async fn get_one(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<LiveVehicleStatus>> {
+    if id.is_empty() {
+        return Err(AppError::BadRequest("vehicle id required".into()));
+    }
+    Ok(Json(s.live.get_by_id(&id).await?))
+}
+
+
+--- FILE: src/api/handlers/vehicles.rs ---
+//! `/api/v1/vehicles*` handlers.
+
+use axum::extract::{Path, State};
+use axum::Json;
+
+use crate::domain::Vehicle;
+use crate::error::{AppError, AppResult};
+use crate::state::AppState;
+
+/// `GET /api/v1/vehicles`
+pub async fn list(State(s): State<AppState>) -> AppResult<Json<Vec<Vehicle>>> {
+    let list = s.vehicles.list().await?;
+    Ok(Json((*list).clone()))
+}
+
+/// `GET /api/v1/vehicles/:id`
+pub async fn get_one(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vehicle>> {
+    if id.is_empty() {
+        return Err(AppError::BadRequest("vehicle id required".into()));
+    }
+    match s.vehicles.get_by_id(&id).await? {
+        Some(v) => Ok(Json(v)),
+        None    => Err(AppError::NotFound(format!("vehicle `{id}` not found"))),
+    }
+}
+
+
+--- FILE: src/api/handlers/admin.rs ---
+//! `/admin/*` — token-gated operational handlers. The auth check is done
+//! by the [`crate::api::middleware::admin_guard`] middleware; handlers here
+//! assume the request is authorized.
+
+use axum::extract::State;
+use axum::Json;
+
+use crate::api::dto::{InvalidateRequest, InvalidateResponse, ReloginResponse};
+use crate::error::{AppError, AppResult};
+use crate::state::AppState;
+
+/// `POST /admin/cache/invalidate { "scope": "all" | "vehicles" | "live" | "history" }`
+pub async fn invalidate(
+    State(s): State<AppState>,
+    Json(req): Json<InvalidateRequest>,
+) -> AppResult<Json<InvalidateResponse>> {
+    match req.scope.as_str() {
+        "all" => {
+            s.cache.invalidate_all().await;
+            // Also wipe persisted history. Vehicles will be re-fetched on
+            // the next Tier A tick anyway.
+            if let Err(e) = s.history.repo.truncate().await {
+                tracing::warn!(error = %e, "history truncate failed");
+            }
+            Ok(Json(InvalidateResponse {
+                scope: "all".into(),
+                ok: true,
+                message: "all caches and persisted history cleared".into(),
+            }))
+        }
+        "vehicles" => {
+            // Force a refresh; the snapshot will be replaced atomically.
+            match s.vehicles.refresh_now().await {
+                Ok(list) => Ok(Json(InvalidateResponse {
+                    scope: "vehicles".into(),
+                    ok: true,
+                    message: format!("vehicles refreshed; {} vehicles", list.len()),
+                })),
+                Err(e) => Err(e),
+            }
+        }
+        "live" => {
+            match s.live.refresh_now().await {
+                Ok(snap) => Ok(Json(InvalidateResponse {
+                    scope: "live".into(),
+                    ok: true,
+                    message: format!("live refreshed; {} vehicles", snap.by_id.len()),
+                })),
+                Err(e) => Err(e),
+            }
+        }
+        "history" => {
+            s.cache.invalidate_all().await;
+            if let Err(e) = s.history.repo.truncate().await {
+                tracing::warn!(error = %e, "history truncate failed");
+            }
+            Ok(Json(InvalidateResponse {
+                scope: "history".into(),
+                ok: true,
+                message: "history caches and persisted rows cleared".into(),
+            }))
+        }
+        other => Err(AppError::BadRequest(format!(
+            "unknown scope `{other}` (allowed: all, vehicles, live, history)"
+        ))),
+    }
+}
+
+/// `POST /admin/auth/relogin` — force a session re-login.
+pub async fn relogin(State(s): State<AppState>) -> AppResult<Json<ReloginResponse>> {
+    let epoch = s.client.force_login().await?;
+    Ok(Json(ReloginResponse { ok: true, epoch }))
+}
+
+
+--- FILE: src/domain/vehicle.rs ---
+//! `Vehicle` — frontend-facing metadata about a tracked unit.
+
+use serde::{Deserialize, Serialize};
+
+use super::time::Timestamp;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Vehicle {
+    pub id: String,
+    pub codename: String,
+    pub plate: String,
+    pub speed_limit: u32,
+    pub online: bool,
+    pub speed: u32,
+    pub status: i32,
+    pub status_label: String,
+    pub last_location_at: Option<Timestamp>,
+
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty", default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Vehicle {
+    /// Best-effort plate extraction from the upstream's "CODE/PLATE" codename.
+    pub fn split_codename(codename: &str) -> (&str, &str) {
+        match codename.split_once('/') {
+            Some((code, plate)) => (code.trim(), plate.trim()),
+            None => (codename.trim(), ""),
+        }
+    }
+}
+
+
+--- FILE: src/domain/time.rs ---
+//! Time handling.
+//!
+//! Internally and at the API boundary we use **UTC, ISO-8601 / RFC3339** — a
+//! shape browsers and Java(Script) parse trivially. The legacy ETIT system
+//! emits localized strings in several formats; [`parse_etit_local`] tries
+//! them in order and converts to UTC.
+//!
+//! `Timestamp` is a thin alias so the rest of the codebase doesn't import
+//! chrono directly.
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
+
+pub type Timestamp = DateTime<Utc>;
+
+pub fn utc_now() -> Timestamp {
+    Utc::now()
+}
+
+/// Parse one of the upstream's many timestamp formats as a *local* clock-time
+/// in `tz`, then convert to UTC. Returns `None` if no format matches.
+pub fn parse_etit_local(raw: &str, tz: Tz) -> Option<Timestamp> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Ordered from most → least specific. Stop on the first match.
+    const FORMATS: &[&str] = &[
+        "%d/%m/%Y %I:%M:%S %p",       // 26/04/2026 03:13:37 PM
+        "%d/%m/%Y %H:%M:%S",          // 26/04/2026 15:13:37
+        "%-m/%-d/%Y %H:%M:%S",        // 4/26/2026 15:13:37
+        "%-m/%-d/%Y %I:%M:%S %p",     // 4/26/2026 03:13:37 PM
+        "%d %B %Y %H:%M:%S",          // 26 April 2026 16:28:00
+        "%d %B %Y %H:%M",             // 26 April 2026 16:28
+        "%d %B %Y %I:%M %p",          // 26 April 2026 04:28 PM
+        "%Y-%m-%dT%H:%M:%S",          // 2026-04-26T16:28:00
+        "%Y-%m-%d %H:%M:%S",          // 2026-04-26 16:28:00
+    ];
+
+    for fmt in FORMATS {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return naive_in_tz_to_utc(naive, tz);
+        }
+    }
+
+    // Fallback: RFC3339 (with offset embedded).
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    None
+}
+
+/// Format a UTC instant for the upstream's `M/D/YYYY HH:MM:SS` history
+/// query — which it expects in *its own* local time.
+pub fn etit_format_for_history(t: Timestamp, tz: Tz) -> String {
+    t.with_timezone(&tz)
+        .format("%-m/%-d/%Y %H:%M:%S")
+        .to_string()
+}
+
+/// Today's date in the configured timezone.
+pub fn today_local(tz: Tz) -> NaiveDate {
+    Utc::now().with_timezone(&tz).date_naive()
+}
+
+/// Start-of-day (00:00:00 local) → UTC.
+pub fn start_of_day_utc(date: NaiveDate, tz: Tz) -> Timestamp {
+    naive_in_tz_to_utc(
+        date.and_hms_opt(0, 0, 0).expect("valid 00:00:00"),
+        tz,
+    )
+    .unwrap_or_else(utc_now)
+}
+
+/// End-of-day (23:59:59 local) → UTC.
+pub fn end_of_day_utc(date: NaiveDate, tz: Tz) -> Timestamp {
+    naive_in_tz_to_utc(
+        date.and_hms_opt(23, 59, 59).expect("valid 23:59:59"),
+        tz,
+    )
+    .unwrap_or_else(utc_now)
+}
+
+/// Helper: a naive local datetime → UTC, picking the earliest valid
+/// instant if the local time falls in a DST gap, and choosing the first
+/// of an ambiguous pair otherwise.
+fn naive_in_tz_to_utc(naive: NaiveDateTime, tz: Tz) -> Option<Timestamp> {
+    use chrono::offset::LocalResult::*;
+    match tz.from_local_datetime(&naive) {
+        Single(local) => Some(local.with_timezone(&Utc)),
+        Ambiguous(early, _late) => Some(early.with_timezone(&Utc)),
+        None => {
+            // DST gap; nudge forward by one hour.
+            let bumped = naive.checked_add_signed(chrono::Duration::hours(1))?;
+            tz.from_local_datetime(&bumped)
+                .single()
+                .map(|d| d.with_timezone(&Utc))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_few_formats() {
+        let cairo = chrono_tz::Africa::Cairo;
+        for s in [
+            "26/04/2026 16:28:00",
+            "26/04/2026 04:28:00 PM",
+            "26 April 2026 16:28",
+            "4/26/2026 16:28:00",
+        ] {
+            assert!(
+                parse_etit_local(s, cairo).is_some(),
+                "failed to parse `{s}`",
+            );
+        }
+    }
+
+    #[test]
+    fn empty_is_none() {
+        assert!(parse_etit_local("", chrono_tz::UTC).is_none());
+        assert!(parse_etit_local("   ", chrono_tz::UTC).is_none());
+    }
+
+    #[test]
+    fn round_trips_history_format() {
+        let cairo = chrono_tz::Africa::Cairo;
+        let t = parse_etit_local("26/04/2026 16:28:00", cairo).unwrap();
+        let formatted = etit_format_for_history(t, cairo);
+        assert_eq!(formatted, "4/26/2026 16:28:00");
+    }
+}
+
+
+--- FILE: src/domain/mod.rs ---
+//! Pure data types passed between layers. No I/O, no derived globals.
+//!
+//! Intentionally minimal: each layer can map *into* these from raw upstream
+//! payloads and *from* these into JSON responses without coupling on the
+//! transport details.
+
+pub mod history;
+pub mod live;
+pub mod time;
+pub mod vehicle;
+
+pub use history::{HistoryPoint, HistoryResponse};
+pub use live::LiveVehicleStatus;
+pub use time::{utc_now, Timestamp};
+pub use vehicle::Vehicle;
+
+/// Upstream status code → human label. The mapping is part of the public
+/// API contract (see `API.md` §3); changing it is a breaking change.
+pub fn status_label(code: i32) -> &'static str {
+    match code {
+        1 | 4    => "Moving",
+        3        => "Stopped (Ignition Off)",
+        12       => "Offline",
+        13       => "Idling (Ignition On)",
+        17 | 18  => "Geofence Violation",
+        _        => "Unknown",
+    }
+}
+
+
+--- FILE: src/domain/history.rs ---
+//! `HistoryPoint`, `HistoryResponse`, and the Google-compatible polyline
+//! encoder.
+//!
+//! The encoder is precision-5 (~1.1 m), matching Google Maps'
+//! `geometry.encoding.decodePath`.
+
+use serde::{Deserialize, Serialize};
+
+use super::time::Timestamp;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPoint {
+    pub lat: f64,
+    pub lng: f64,
+    pub timestamp: Option<Timestamp>,
+    pub speed: u32,
+    pub speed_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stop {
+    pub lat: f64,
+    pub lng: f64,
+    pub from: Timestamp,
+    pub to: Timestamp,
+    pub duration: String,
+    pub address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SensorEvent {
+    pub lat: f64,
+    pub lng: f64,
+    pub timestamp: Timestamp,
+    pub type_name: String,
+}#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TripSummary {
+    pub total_mileage: String,
+    pub total_active_time: String,
+    pub total_passive_time: String,
+    pub total_idle_time: String,
+    pub driver_name: String,
+    pub number_of_stops: String,
+    pub total_disconnected_time: String,
+    pub total_fuel_consumption: String,
+    pub ignition_off_count: String,
+    pub ignition_on_count: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryResponse {
+    pub vehicle_id: String,
+    pub from: Timestamp,
+    pub to: Timestamp,
+    pub points: Vec<HistoryPoint>,
+    pub stops: Vec<Stop>,
+    pub sensors: Vec<SensorEvent>,
+    pub geometry: String,
+    pub cached: bool,
+    pub fetched_at: Timestamp,
+}
+
+impl HistoryResponse {
+    pub fn build(
+        vehicle_id: String,
+        from: Timestamp,
+        to: Timestamp,
+        points: Vec<HistoryPoint>,
+        stops: Vec<Stop>,
+        sensors: Vec<SensorEvent>,
+        cached: bool,
+        fetched_at: Timestamp,
+    ) -> Self {
+        // Apply dynamic compression to both the points array and the geometry.
+        let points = simplify_points(&points);
+        let geometry = encode_polyline(&points);
+
+        Self {
+            vehicle_id,
+            from,
+            to,
+            points,
+            stops,
+            sensors,
+            geometry,
+            cached,
+            fetched_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedHistory {
+    pub points: Vec<HistoryPoint>,
+    pub stops: Vec<Stop>,
+    pub sensors: Vec<SensorEvent>,
+    pub geometry: String,
+    pub fetched_at: Timestamp,
+}
+
+/// Encode a polyline at precision 5. Compatible with
+/// `google.maps.geometry.encoding.decodePath`.
+pub fn encode_polyline(points: &[HistoryPoint]) -> String {
+    if points.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(points.len() * 4);
+    let mut last_lat = 0i64;
+    let mut last_lng = 0i64;
+
+    for p in points {
+        let lat = (p.lat * 1e5).round() as i64;
+        let lng = (p.lng * 1e5).round() as i64;
+        encode_value((lat - last_lat) as i32, &mut out);
+        encode_value((lng - last_lng) as i32, &mut out);
+        last_lat = lat;
+        last_lng = lng;
+    }
+    out
+}
+
+pub fn simplify_points(points: &[HistoryPoint]) -> Vec<HistoryPoint> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+
+    let mut simplified = Vec::with_capacity(points.len() / 2);
+    simplified.push(points[0].clone());
+
+    let mut last_idx = 0;
+    for i in 1..points.len() {
+        let last = &points[last_idx];
+        let curr = &points[i];
+        
+        // Always keep the last point.
+        if i == points.len() - 1 {
+            simplified.push(curr.clone());
+            break;
+        }
+
+        let d2 = distance_meters_sq(last, curr);
+
+        // 1. Radial filter: skip if too close (< 5m).
+        if d2 < 25.0 {
+            continue;
+        }
+
+        // 2. Max segment length: keep if we've gone > 2km on a straight.
+        if d2 > 4_000_000.0 {
+            simplified.push(curr.clone());
+            last_idx = i;
+            continue;
+        }
+
+        // 3. Perpendicular deviation check.
+        let next = &points[i + 1];
+        let perp = perpendicular_distance_meters(last, next, curr);
+        
+        if perp > 15.0 {
+            simplified.push(curr.clone());
+            last_idx = i;
+        }
+    }
+    simplified
+}
+
+fn distance_meters_sq(p1: &HistoryPoint, p2: &HistoryPoint) -> f64 {
+    let lat_mid = (p1.lat + p2.lat) / 2.0;
+    let cos_lat = (lat_mid.to_radians()).cos();
+    let dy = (p1.lat - p2.lat) * 111_320.0;
+    let dx = (p1.lng - p2.lng) * 111_320.0 * cos_lat;
+    dy * dy + dx * dx
+}
+
+fn perpendicular_distance_meters(a: &HistoryPoint, b: &HistoryPoint, p: &HistoryPoint) -> f64 {
+    let lat_mid = (a.lat + b.lat) / 2.0;
+    let cos_lat = (lat_mid.to_radians()).cos();
+    
+    let x1 = a.lng * 111_320.0 * cos_lat;
+    let y1 = a.lat * 111_320.0;
+    let x2 = b.lng * 111_320.0 * cos_lat;
+    let y2 = b.lat * 111_320.0;
+    let xp = p.lng * 111_320.0 * cos_lat;
+    let yp = p.lat * 111_320.0;
+
+    let num = ((y2 - y1) * xp - (x2 - x1) * yp + x2 * y1 - y2 * x1).abs();
+    let den = ((y2 - y1).powi(2) + (x2 - x1).powi(2)).sqrt();
+    
+    if den < 0.01 {
+        return ((xp - x1).powi(2) + (yp - y1).powi(2)).sqrt();
+    }
+    num / den
+}
+
+fn encode_value(v: i32, out: &mut String) {
+    let mut v = if v < 0 { !(v << 1) } else { v << 1 };
+    while v >= 0x20 {
+        let chunk = (0x20 | (v & 0x1f)) + 63;
+        out.push(char::from_u32(chunk as u32).unwrap_or('?'));
+        v >>= 5;
+    }
+    out.push(char::from_u32((v + 63) as u32).unwrap_or('?'));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_polyline_is_empty_string() {
+        assert_eq!(encode_polyline(&[]), "");
+    }
+
+    #[test]
+    fn single_point_encodes_to_known_value() {
+        // (38.5, -120.2) — matches Google's reference output `_p~iF~ps|U`.
+        let pts = vec![HistoryPoint {
+            lat: 38.5,
+            lng: -120.2,
+            timestamp: None,
+            speed: 0,
+            speed_limit: 0,
+        }];
+        assert_eq!(encode_polyline(&pts), "_p~iF~ps|U");
+    }
+
+    #[test]
+    fn test_compression_idling() {
+        let mut pts = Vec::new();
+        // 10 points at the same spot
+        for _ in 0..10 {
+            pts.push(HistoryPoint {
+                lat: 30.0, lng: 31.0, timestamp: None, speed: 0, speed_limit: 80
+            });
+        }
+        let simplified = simplify_points(&pts);
+        // Should be reduced to 2 points (first and last)
+        assert_eq!(simplified.len(), 2);
+    }
+
+    #[test]
+    fn test_straight_line_compression() {
+        let mut pts = Vec::new();
+        // 20 points in a perfectly straight line, 5m apart (~100m total)
+        for i in 0..20 {
+            pts.push(HistoryPoint {
+                lat: 30.0 + (i as f64 * 0.000045), 
+                lng: 31.0, 
+                timestamp: None, 
+                speed: 60, 
+                speed_limit: 80
+            });
+        }
+        let simplified = simplify_points(&pts);
+        // 100m straight should be compressed significantly (down to ~2-3 points)
+        assert!(simplified.len() < 5);
+    }
+}
+
+
+--- FILE: src/domain/live.rs ---
+//! `LiveVehicleStatus` — one current snapshot per vehicle.
+
+use serde::{Deserialize, Serialize};
+
+use super::time::Timestamp;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveVehicleStatus {
+    pub id: String,
+    pub plate: Option<String>,
+    pub speed: i32,
+    pub status: i32,
+    pub status_label: String,
+    pub lat: f64,
+    pub lng: f64,
+    pub timestamp: Option<Timestamp>,
+    pub event: Option<String>,
+    pub sensor_data: Option<String>,
+}
+
+
+--- FILE: src/services/broadcaster.rs ---
+//! Live-status broadcaster.
+//!
+//! The Tier B poller produces a fresh `LiveSnapshot` every minute. Anyone
+//! who wants to receive these — currently the SSE handler — subscribes to
+//! the broadcast channel and gets an `LiveEvent::Update` per tick.
+//!
+//! `tokio::sync::broadcast` semantics: lagging receivers drop the oldest
+//! events but never block the publisher. That's exactly what we want for a
+//! "the freshest snapshot wins" feed.
+
+use std::sync::Arc;
+
+use tokio::sync::broadcast;
+
+use crate::cache::memory::LiveSnapshot;
+
+/// One event on the live-status feed. `Update` carries an immutable snapshot.
+#[derive(Clone, Debug)]
+pub enum LiveEvent {
+    Update(LiveSnapshot),
+}
+
+/// Wrapper around a broadcast sender so the rest of the code doesn't import
+/// tokio types directly.
+pub struct Broadcaster {
+    tx: broadcast::Sender<LiveEvent>,
+}
+
+impl Broadcaster {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        let (tx, _rx) = broadcast::channel(capacity.max(1));
+        Arc::new(Self { tx })
+    }
+
+    /// Publish a snapshot. Errors only when there are zero subscribers, which
+    /// is fine — we silently drop in that case.
+    pub fn publish(&self, ev: LiveEvent) {
+        let _ = self.tx.send(ev);
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<LiveEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+}
+
+
+--- FILE: src/services/mod.rs ---
+//! Orchestration layer.
+//!
+//! Each service module is the *only* place in the codebase that knows the
+//! full read path for one resource: try memory cache → try DB → fetch from
+//! upstream → write back to both. Handlers must always call services, never
+//! upstream or DB directly.
+
+pub mod broadcaster;
+pub mod history;
+pub mod live;
+pub mod vehicles;
+
+pub use broadcaster::{Broadcaster, LiveEvent};
+
+
+--- FILE: src/services/history.rs ---
+//! History service.
+//!
+//! Read order for a single calendar day:
+//!   1. memory cache,
+//!   2. SQLite,
+//!   3. upstream (collapsed via `SingleFlight` so concurrent identical
+//!      requests for the same `(vehicle, date)` produce only one upstream
+//!      call).
+//!
+//! Range queries (arbitrary `from`/`to`) bypass both caches and go straight
+//! to upstream. They're rare and rarely repeat, so caching them adds
+//! complexity without proportional benefit.
+
+use std::sync::Arc;
+
+use chrono::NaiveDate;
+
+use crate::cache::memory::CacheLayer;
+use crate::cache::SingleFlight;
+use crate::db::HistoryRepo;
+use crate::domain::history::{encode_polyline, CachedHistory, HistoryResponse};
+use crate::domain::time::{end_of_day_utc, parse_etit_local, start_of_day_utc, utc_now};
+use crate::error::AppError;
+use crate::upstream::{history as up, EtitClient};
+
+pub struct HistoryService {
+    pub client: Arc<EtitClient>,
+    pub cache: Arc<CacheLayer>,
+    pub repo: HistoryRepo,
+    pub flight: SingleFlight<(String, NaiveDate), CachedHistory>,
+}
+
+impl HistoryService {
+    pub fn new(client: Arc<EtitClient>, cache: Arc<CacheLayer>, repo: HistoryRepo) -> Self {
+        Self {
+            client,
+            cache,
+            repo,
+            flight: SingleFlight::new(),
+        }
+    }
+
+    /// One full calendar day in the configured timezone.
+    pub async fn for_day(
+        &self,
+        vehicle_id: &str,
+        date: NaiveDate,
+        force_refresh: bool,
+    ) -> Result<HistoryResponse, AppError> {
+        if vehicle_id.is_empty() {
+            return Err(AppError::BadRequest("vehicle id required".into()));
+        }
+        let tz = self.cache.tz;
+        let from = start_of_day_utc(date, tz);
+        let to = end_of_day_utc(date, tz);
+
+        let (cached, was_cache_hit) = self.get_or_fetch_day(vehicle_id, date, force_refresh).await?;
+
+        Ok(HistoryResponse::build(
+            vehicle_id.to_string(),
+            from,
+            to,
+            cached.points.clone(),
+            cached.stops.clone(),
+            cached.sensors.clone(),
+            was_cache_hit,
+            cached.fetched_at,
+        ))
+    }
+
+    /// Internal helper: fetch a single full day from Memory -> DB -> Upstream.
+    /// Returns (data, is_cache_hit).
+    async fn get_or_fetch_day(
+        &self,
+        vehicle_id: &str,
+        date: NaiveDate,
+        force_refresh: bool,
+    ) -> Result<(CachedHistory, bool), AppError> {
+        // 1. Memory cache hit.
+        if !force_refresh {
+            if let Some(cached) = self.cache.get_history(vehicle_id, date).await {
+                if !cached.points.is_empty() {
+                    tracing::debug!(vehicle_id, %date, "history memory cache hit");
+                    return Ok(((*cached).clone(), true));
+                }
+            }
+        }
+
+        // 2. DB hit (warm cold cache from disk).
+        if !force_refresh {
+            if let Some(cached) = self.repo.get(vehicle_id, date).await.map_err(internal)? {
+                if !cached.points.is_empty() {
+                    tracing::info!(vehicle_id, %date, "history DB cache hit (promoting to memory)");
+                    self.cache
+                        .store_history(vehicle_id, date, Arc::new(cached.clone()))
+                        .await;
+                    return Ok((cached, true));
+                }
+            }
+        }
+
+        tracing::info!(vehicle_id, %date, force = force_refresh, "history cache miss; fetching upstream");
+
+        // 3. Upstream — collapse concurrent identical requests.
+        let tz = self.cache.tz;
+        let from = start_of_day_utc(date, tz);
+        let to = end_of_day_utc(date, tz);
+        let key = (vehicle_id.to_string(), date);
+        let client = self.client.clone();
+        let cache = self.cache.clone();
+        let repo = self.repo.clone(); // Clone repo for use in the closure
+        let vid = vehicle_id.to_string();
+        let is_hot = self.cache.is_hot_date(date);
+
+        let cached: CachedHistory = self
+            .flight
+            .run(key, || async move {
+                let upstream = up::fetch_range(&client, &vid, from, to).await?;
+
+                // --- Safety Latch ---
+                // If upstream returns 0 points, check if we already have data.
+                // If we do, don't overwrite with an empty set.
+                if upstream.points.is_empty() {
+                    if let Ok(Some(existing)) = repo.get(&vid, date).await {
+                        if !existing.points.is_empty() {
+                            tracing::warn!(
+                                vehicle_id = %vid,
+                                %date,
+                                "upstream returned empty history but local DB has data; ignoring wipe"
+                            );
+                            return Ok(existing);
+                        }
+                    }
+                }
+
+                let geometry = encode_polyline(&upstream.points);
+                let fetched_at = utc_now();
+                let cached = CachedHistory {
+                    points: upstream.points,
+                    stops: upstream.stops,
+                    sensors: upstream.sensors,
+                    geometry,
+                    fetched_at,
+                };
+                cache
+                    .store_history(&vid, date, Arc::new(cached.clone()))
+                    .await;
+                Ok::<_, AppError>(cached)
+            })
+            .await?;
+
+        // Persist to DB outside the singleflight closure.
+        if let Err(e) = self.repo.upsert(vehicle_id, date, &cached, is_hot).await {
+            tracing::warn!(vehicle_id, %date, error = %e, "history DB upsert failed");
+        }
+
+        Ok((cached, false))
+    }
+
+    /// Arbitrary `from`/`to` range. Strings come from the API in either
+    /// `YYYY-MM-DDTHH:MM:SS` (interpreted as local time in the configured
+    /// timezone) or full RFC3339 with offset.
+    pub async fn for_range(
+        &self,
+        vehicle_id: &str,
+        from_raw: &str,
+        to_raw: &str,
+        force_refresh: bool,
+    ) -> Result<HistoryResponse, AppError> {
+        if vehicle_id.is_empty() {
+            return Err(AppError::BadRequest("vehicle id required".into()));
+        }
+        let tz = self.cache.tz;
+        let from = parse_etit_local(from_raw, tz)
+            .ok_or_else(|| AppError::BadRequest(format!("invalid `from` datetime: {from_raw}")))?;
+        let to = parse_etit_local(to_raw, tz)
+            .ok_or_else(|| AppError::BadRequest(format!("invalid `to` datetime: {to_raw}")))?;
+        if to <= from {
+            return Err(AppError::BadRequest("`to` must be after `from`".into()));
+        }
+
+        // 1. Identify which calendar days this range spans in the local timezone.
+        let today = self.cache.today_local();
+        let start_date = from.with_timezone(&tz).date_naive();
+        let end_date = to.with_timezone(&tz).date_naive().min(today);
+
+        if start_date > today {
+             // Requesting entirely in the future? Return early.
+             return Ok(HistoryResponse::build(
+                 vehicle_id.to_string(),
+                 from,
+                 to,
+                 Vec::new(),
+                 Vec::new(),
+                 Vec::new(),
+                 true,
+                 utc_now(),
+             ));
+        }
+
+        let mut all_points = Vec::new();
+        let mut all_stops = Vec::new();
+        let mut all_sensors = Vec::new();
+        let mut all_cached = true;
+        let mut oldest_fetch = utc_now();
+
+        // 2. Fetch each full day and collect the parts.
+        let mut curr = start_date;
+        while curr <= end_date {
+            let (day_data, is_hit) = self.get_or_fetch_day(vehicle_id, curr, force_refresh).await?;
+            all_points.extend(day_data.points);
+            all_stops.extend(day_data.stops);
+            all_sensors.extend(day_data.sensors);
+            
+            if !is_hit {
+                all_cached = false;
+            }
+            if day_data.fetched_at < oldest_fetch {
+                oldest_fetch = day_data.fetched_at;
+            }
+
+            curr = curr.succ_opt().unwrap_or(curr);
+            if curr == end_date.succ_opt().unwrap_or(end_date) {
+                // succ_opt overflow protection
+                if curr <= end_date { continue; } else { break; }
+            }
+        }
+
+        // 3. Filter to the exact window.
+        let points: Vec<_> = all_points
+            .into_iter()
+            .filter(|p| {
+                if let Some(t) = p.timestamp {
+                    t >= from && t <= to
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        let stops: Vec<_> = all_stops
+            .into_iter()
+            .filter(|s| s.from >= from && s.from <= to)
+            .collect();
+
+        let sensors: Vec<_> = all_sensors
+            .into_iter()
+            .filter(|s| s.timestamp >= from && s.timestamp <= to)
+            .collect();
+
+        // 4. Build the final response (geometry is re-encoded for the filtered set).
+        Ok(HistoryResponse::build(
+            vehicle_id.to_string(),
+            from,
+            to,
+            points,
+            stops,
+            sensors,
+            all_cached,
+            oldest_fetch,
+        ))
+    }
+
+    pub async fn get_trip_summary(
+        &self,
+        vehicle_id: &str,
+        from_raw: &str,
+        to_raw: &str,
+    ) -> Result<crate::domain::history::TripSummary, AppError> {
+        if vehicle_id.is_empty() {
+            return Err(AppError::BadRequest("vehicle id required".into()));
+        }
+        let tz = self.cache.tz;
+        let from = parse_etit_local(from_raw, tz)
+            .ok_or_else(|| AppError::BadRequest(format!("invalid `from` datetime: {from_raw}")))?;
+        let to = parse_etit_local(to_raw, tz)
+            .ok_or_else(|| AppError::BadRequest(format!("invalid `to` datetime: {to_raw}")))?;
+
+        up::fetch_trip_summary(&self.client, vehicle_id, from, to).await
+    }
+}
+
+fn internal(e: anyhow::Error) -> AppError {
+    AppError::Internal(e)
+}
+
+
+--- FILE: src/services/live.rs ---
+//! Live-status service.
+//!
+//! Reads are cheap: the Tier B poller fully overwrites the live snapshot
+//! every minute, so handlers just clone the in-memory snapshot. On cold
+//! start (before the first Tier B tick) we fall back to a synchronous fetch
+//! so the dashboard isn't blank for the first 60s.
+
+use std::sync::Arc;
+
+use crate::cache::memory::LiveSnapshot;
+use crate::cache::CacheLayer;
+use crate::domain::LiveVehicleStatus;
+use crate::error::AppError;
+use crate::services::vehicles::VehiclesService;
+use crate::upstream::{live as up, EtitClient};
+
+pub struct LiveService {
+    pub client: Arc<EtitClient>,
+    pub cache: Arc<CacheLayer>,
+    pub vehicles: Arc<VehiclesService>,
+}
+
+impl LiveService {
+    /// Snapshot of all vehicles, sorted by id for stable React diffing.
+    pub async fn list(&self) -> Result<Vec<LiveVehicleStatus>, AppError> {
+        let snap = self.cache.live_snapshot();
+        if !snap.by_id.is_empty() {
+            let mut out: Vec<LiveVehicleStatus> =
+                snap.by_id.values().cloned().collect();
+            out.sort_by(|a, b| a.id.cmp(&b.id));
+            return Ok(out);
+        }
+        // Cold start.
+        self.refresh_now().await?;
+        let snap = self.cache.live_snapshot();
+        let mut out: Vec<LiveVehicleStatus> = snap.by_id.values().cloned().collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    /// Single-vehicle live status, or 404 if missing.
+    pub async fn get_by_id(&self, id: &str) -> Result<LiveVehicleStatus, AppError> {
+        let snap = self.cache.live_snapshot();
+        if let Some(s) = snap.by_id.get(id) {
+            return Ok(s.clone());
+        }
+        // Cold start path.
+        self.refresh_now().await?;
+        let snap = self.cache.live_snapshot();
+        snap.by_id
+            .get(id)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("no live status for vehicle `{id}`")))
+    }
+
+    /// Force-fetch from upstream and store. Returns the new snapshot for
+    /// the caller's convenience (used by the poller to publish on the
+    /// broadcaster).
+    pub async fn refresh_now(&self) -> Result<LiveSnapshot, AppError> {
+        let vehicles = self.vehicles.list().await?;
+        if vehicles.is_empty() {
+            // No vehicles to query for. Store an empty snapshot so the
+            // freshness clock still ticks.
+            self.cache.store_live(Vec::new());
+            return Ok(self.cache.live_snapshot());
+        }
+        let rows = up::fetch_live(&self.client, &vehicles).await?;
+        self.cache.store_live(rows);
+        Ok(self.cache.live_snapshot())
+    }
+}
+
+
+--- FILE: src/services/vehicles.rs ---
+//! Vehicles service.
+//!
+//! Read order:
+//!   1. memory cache, if fresh
+//!   2. memory cache, even if stale (best-effort)
+//!   3. upstream — and only if everything else is empty do we go here
+//!      synchronously; under normal operation the Tier A poller refreshes
+//!      well before the read TTL elapses.
+//!
+//! Writes go to memory + DB so a restart immediately serves stale-but-useful
+//! data while the first Tier A tick runs.
+
+use std::sync::Arc;
+
+use crate::cache::CacheLayer;
+use crate::db::VehiclesRepo;
+use crate::domain::Vehicle;
+use crate::error::AppError;
+use crate::upstream::{vehicles as up, EtitClient};
+
+pub struct VehiclesService {
+    pub client: Arc<EtitClient>,
+    pub cache: Arc<CacheLayer>,
+    pub repo: VehiclesRepo,
+}
+
+impl VehiclesService {
+    pub async fn list(&self) -> Result<Arc<Vec<Vehicle>>, AppError> {
+        // Fresh hit — return immediately.
+        if self.cache.vehicles_is_fresh() {
+            return Ok(self.cache.vehicles_snapshot().vehicles);
+        }
+
+        // Stale hit — return what we have; let the poller refresh in background.
+        let snap = self.cache.vehicles_snapshot();
+        if !snap.vehicles.is_empty() {
+            return Ok(snap.vehicles);
+        }
+
+        // Cold start: hit upstream synchronously, then store everywhere.
+        self.refresh_now().await
+    }
+
+    pub async fn get_by_id(&self, id: &str) -> Result<Option<Vehicle>, AppError> {
+        let list = self.list().await?;
+        Ok(list.iter().find(|v| v.id == id).cloned())
+    }
+
+    /// Force a fetch from upstream and write to both caches. Used by the Tier A
+    /// poller and by cold-start.
+    pub async fn refresh_now(&self) -> Result<Arc<Vec<Vehicle>>, AppError> {
+        let fetched = up::fetch_all(&self.client).await?;
+        self.cache.store_vehicles(fetched.clone());
+        if let Err(e) = self.repo.replace_all(&fetched).await {
+            tracing::warn!(error = %e, "failed to persist vehicles snapshot");
+        }
+        Ok(self.cache.vehicles_snapshot().vehicles)
+    }
+}
+
+
+--- FILE: src/upstream/parsers.rs ---
+//! Tiny string helpers shared across upstream integrations.
+
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+
+/// Most of the API needs a strict percent-encode (no slashes, no spaces).
+pub const FRAGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'`')
+    .add(b'#')
+    .add(b'?')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'\\')
+    .add(b'&')
+    .add(b'=')
+    .add(b'+')
+    .add(b':')
+    .add(b';')
+    .add(b',');
+
+pub fn pct(s: &str) -> String {
+    utf8_percent_encode(s, FRAGMENT).to_string()
+}
+
+pub fn truncate_for_log(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..n])
+    }
+}
+
+/// Legacy ETIT history endpoint sometimes returns "JSON" with **unquoted**
+/// top-level keys (`{history:[...]}`). This helper double-quotes them so
+/// `serde_json` can parse the payload.
+///
+/// Conservative: only matches keys that follow `{` or `,` and look like
+/// identifiers. Will not perturb keys inside string values.
+pub fn fix_unquoted_json_keys(s: &str) -> String {
+    static KEY_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"([\{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:").unwrap()
+    });
+    static COMMA_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r",\s*([\]\}])").unwrap()
+    });
+
+    let s = KEY_RE.replace_all(s, r#"$1"$2":"#);
+    COMMA_RE.replace_all(&s, r"$1").into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixes_unquoted_keys() {
+        let bad  = r#"{history:[{p:[],d:"1"}],meta:1}"#;
+        let good = fix_unquoted_json_keys(bad);
+        assert_eq!(
+            good,
+            r#"{"history":[{"p":[],"d":"1"}],"meta":1}"#
+        );
+    }
+
+    #[test]
+    fn leaves_already_quoted_alone() {
+        let s = r#"{"history":[]}"#;
+        assert_eq!(fix_unquoted_json_keys(s), s);
+    }
+}
+
+
+--- FILE: src/upstream/client.rs ---
+//! Auth-aware HTTP client. Hands every data request to the upstream, with
+//! transparent re-login on session expiry and exponential backoff on
+//! transient failures.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, REFERER};
+use reqwest::redirect::Policy;
+use reqwest::{Method, Response, StatusCode};
+use serde::Serialize;
+use tokio::sync::Mutex;
+
+use crate::config::Config;
+use crate::error::AppError;
+
+use super::auth::{login, AuthState, USER_AGENT_VALUE};
+
+/// The auth-aware client every higher layer uses.
+pub struct EtitClient {
+    cfg: Config,
+    http: reqwest::Client,
+    auth: Mutex<AuthState>,
+}
+
+impl EtitClient {
+    pub fn new(cfg: Config) -> anyhow::Result<Arc<Self>> {
+        // We manage cookies ourselves (cross-domain), so disable the jar.
+        // We follow redirects manually so we can detect login bounces.
+        let mut builder = reqwest::Client::builder()
+            .cookie_store(false)
+            .redirect(Policy::none())
+            .timeout(cfg.upstream_timeout)
+            .user_agent(USER_AGENT_VALUE)
+            .gzip(true)
+            .min_tls_version(reqwest::tls::Version::TLS_1_2)
+            .max_tls_version(reqwest::tls::Version::TLS_1_2);
+
+        if let Some(proxy_url) = &cfg.upstream_proxy {
+            let proxy = reqwest::Proxy::all(proxy_url)
+                .context("parsing UPSTREAM_PROXY")?;
+            builder = builder.proxy(proxy);
+        }
+
+        let http = builder.build().context("building reqwest client")?;
+
+        Ok(Arc::new(Self {
+            cfg,
+            http,
+            auth: Mutex::new(AuthState::default()),
+        }))
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.cfg
+    }
+
+    pub fn data_url(&self) -> &str {
+        &self.cfg.etit_data_url
+    }
+
+    pub async fn auth_snapshot(&self) -> AuthState {
+        self.auth.lock().await.clone()
+    }
+
+    /// Force a login regardless of current state.
+    pub async fn force_login(&self) -> Result<u64, AppError> {
+        let mut guard = self.auth.lock().await;
+        let next_epoch = guard.epoch.wrapping_add(1);
+        let mut new_state = login(&self.http, &self.cfg)
+            .await
+            .map_err(|e| AppError::Login(e.to_string()))?;
+        new_state.epoch = next_epoch;
+        *guard = new_state;
+        tracing::info!(
+            sub_id = %guard.sub_id,
+            staff_id = %guard.staff_id,
+            epoch = guard.epoch,
+            "ETIT login established",
+        );
+        Ok(guard.epoch)
+    }
+
+    /// Ensure we have a session; if our snapshot's epoch matches the current
+    /// state's, perform a login. If a concurrent caller already advanced the
+    /// epoch, we return without re-logging.
+    pub async fn ensure_logged_in(&self, observed_epoch: u64) -> Result<(), AppError> {
+        let mut guard = self.auth.lock().await;
+        if guard.epoch != observed_epoch {
+            return Ok(());
+        }
+        let next_epoch = guard.epoch.wrapping_add(1);
+        let mut new_state = login(&self.http, &self.cfg)
+            .await
+            .map_err(|e| AppError::Login(e.to_string()))?;
+        new_state.epoch = next_epoch;
+        *guard = new_state;
+        tracing::info!(
+            sub_id   = %guard.sub_id,
+            staff_id = %guard.staff_id,
+            epoch    = guard.epoch,
+            "ETIT login refreshed",
+        );
+        Ok(())
+    }
+
+    /// Workhorse for all data calls. Builds the request with the current
+    /// cookie header, retries on session expiry, and on transient errors
+    /// applies exponential backoff up to `upstream_retry_max` extra attempts.
+    ///
+    /// The closure receives `(&Client, &cookie_header)` and must produce a
+    /// `RequestBuilder`. It will be re-invoked across retries with potentially
+    /// different cookies, so it must be fresh-rebuildable.
+    pub async fn request_data<F>(&self, build: F) -> Result<Response, AppError>
+    where
+        F: Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
+    {
+        // Single re-login attempt + N retries on transient errors.
+        let mut last_err: Option<AppError> = None;
+
+        for attempt in 0..=self.cfg.upstream_retry_max {
+            // Snapshot the auth state for this attempt.
+            let (epoch, cookie) = {
+                let g = self.auth.lock().await;
+                (g.epoch, g.cookie_header.clone())
+            };
+
+            match build(&self.http, &cookie).send().await {
+                Ok(resp) => {
+                    if is_session_redirect(&resp) {
+                        drop(resp);
+                        self.ensure_logged_in(epoch).await?;
+
+                        let cookie2 = self.auth.lock().await.cookie_header.clone();
+                        let resp2 = build(&self.http, &cookie2).send().await?;
+                        if is_session_redirect(&resp2) {
+                            return Err(AppError::SessionDead);
+                        }
+                        return Ok(resp2);
+                    }
+                    return Ok(resp);
+                }
+                Err(e) if is_transient(&e) && attempt < self.cfg.upstream_retry_max => {
+                    let backoff = self.backoff_for(attempt);
+                    tracing::warn!(
+                        attempt, ?backoff, error = %e,
+                        "transient upstream error; retrying",
+                    );
+                    tokio::time::sleep(backoff).await;
+                    last_err = Some(e.into());
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(last_err.unwrap_or(AppError::SessionDead))
+    }
+
+    fn backoff_for(&self, attempt: u32) -> Duration {
+        let base = self.cfg.upstream_retry_base.as_millis() as u64;
+        let factor = 1u64 << attempt.min(8); // cap doubling
+        Duration::from_millis(base.saturating_mul(factor))
+    }
+
+    // ---- header builders ---------------------------------------------------
+
+    fn json_headers(&self, cookie_header: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json; charset=UTF-8"));
+        h.insert(ACCEPT, HeaderValue::from_static("application/json, text/javascript, */*; q=0.01"));
+        h.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+        let referer = format!("{}/WebPages/maps.aspx", self.cfg.etit_data_url);
+        if let Ok(v) = HeaderValue::from_str(&referer) { h.insert(REFERER, v); }
+        if !cookie_header.is_empty() {
+            if let Ok(v) = HeaderValue::from_str(cookie_header) { h.insert(COOKIE, v); }
+        }
+        h
+    }
+
+    fn form_headers(&self, cookie_header: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded; charset=UTF-8"));
+        h.insert(ACCEPT, HeaderValue::from_static("*/*"));
+        h.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+        let referer = format!("{}/WebPages/maps.aspx", self.cfg.etit_data_url);
+        if let Ok(v) = HeaderValue::from_str(&referer) { h.insert(REFERER, v); }
+        if !cookie_header.is_empty() {
+            if let Ok(v) = HeaderValue::from_str(cookie_header) { h.insert(COOKIE, v); }
+        }
+        h
+    }
+
+    // ---- convenience verbs -------------------------------------------------
+
+    pub async fn post_json<B: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        path: &str,
+        body: B,
+    ) -> Result<Response, AppError> {
+        let url = format!("{}{path}", self.cfg.etit_data_url);
+        self.request_data(move |c, cookie| {
+            c.request(Method::POST, &url).headers(self.json_headers(cookie)).json(&body)
+        })
+        .await
+    }
+
+    pub async fn post_form(
+        &self,
+        path: &str,
+        form: Vec<(String, String)>,
+    ) -> Result<Response, AppError> {
+        let url = format!("{}{path}", self.cfg.etit_data_url);
+        self.request_data(move |c, cookie| {
+            c.request(Method::POST, &url).headers(self.form_headers(cookie)).form(&form)
+        })
+        .await
+    }
+
+    pub async fn get(&self, path_and_query: &str) -> Result<Response, AppError> {
+        let url = format!("{}{path_and_query}", self.cfg.etit_data_url);
+        self.request_data(move |c, cookie| {
+            c.request(Method::GET, &url).headers(self.json_headers(cookie))
+        })
+        .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response helpers
+// ---------------------------------------------------------------------------
+
+fn is_session_redirect(resp: &Response) -> bool {
+    let s = resp.status();
+    if s != StatusCode::FOUND
+        && s != StatusCode::MOVED_PERMANENTLY
+        && s != StatusCode::SEE_OTHER
+        && s != StatusCode::TEMPORARY_REDIRECT
+    {
+        return false;
+    }
+    match resp.headers().get(reqwest::header::LOCATION) {
+        Some(loc) => {
+            let s = loc.to_str().unwrap_or("").to_ascii_lowercase();
+            s.contains("etitlogin.aspx") || s.contains("login.aspx") || s.contains("/login")
+        }
+        None => true,
+    }
+}
+
+fn is_transient(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_timeout() || e.is_request()
+}
+
+
+--- FILE: src/upstream/auth.rs ---
+//! Login flow.
+//!
+//! ETIT is two ASP.NET hosts behind one logical app:
+//!
+//! - `etit-fms.etit-eg.com`  — login, identity, SSOCookie issuance
+//! - `fms-gps.etit-eg.com`   — data
+//!
+//! reqwest's cookie jar is domain-scoped, so cookies set by the login host
+//! are never replayed against the data host. We work around this by reading
+//! `Set-Cookie` headers manually, capturing `ASP.NET_SessionId` + `SSOCookie`,
+//! and synthesizing a single `Cookie:` header that we inject on every data
+//! request.
+//!
+//! The login flow itself is three steps:
+//!
+//! 1. `GET  /ETITlogin.aspx` to scrape `__VIEWSTATE` / `__VIEWSTATEGENERATOR`.
+//! 2. `POST /ETITlogin.aspx` with credentials (ASP.NET partial-postback).
+//!    The response body is a ScriptManager pipe-delimited blob containing
+//!    a `pageRedirect` directive — *not* a real HTTP redirect.
+//! 3. `GET <pageRedirect target>` to provoke `Set-Cookie: SSOCookie=...`.
+//!
+//! The login is mutually exclusive with itself via a `tokio::Mutex` keyed
+//! by an epoch counter, so concurrent expiring requests trigger a single
+//! re-login.
+
+use anyhow::{anyhow, Context};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, REFERER, USER_AGENT};
+
+use crate::config::Config;
+
+pub const USER_AGENT_VALUE: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+     (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 etit-proxy/0.2";
+
+// Regex pairs cope with attribute order variation in ASP.NET's emitted HTML.
+static VIEWSTATE_RE_FWD: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"id="__VIEWSTATE"[^>]*value="([^"]*)""#).unwrap());
+static VIEWSTATE_RE_REV: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"value="([^"]*)"[^>]*id="__VIEWSTATE""#).unwrap());
+
+static GENERATOR_RE_FWD: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"id="__VIEWSTATEGENERATOR"[^>]*value="([^"]*)""#).unwrap());
+static GENERATOR_RE_REV: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"value="([^"]*)"[^>]*id="__VIEWSTATEGENERATOR""#).unwrap());
+
+static SUBID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)subid\s*[=:|]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+        .unwrap()
+});
+static STAFFID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)staffid\s*[=:|]\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+        .unwrap()
+});
+static GUID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap()
+});
+
+/// Snapshot of upstream session state. Cheap to clone.
+#[derive(Debug, Clone, Default)]
+pub struct AuthState {
+    pub sub_id: String,
+    pub staff_id: String,
+    /// Bumped every successful login. Used to gate concurrent re-logins.
+    pub epoch: u64,
+    /// Pre-built `Cookie:` header value, ready to inject into data calls.
+    pub cookie_header: String,
+    /// When this state was established. `None` ⇒ never logged in.
+    pub last_login_at: Option<crate::domain::Timestamp>,
+}
+
+impl AuthState {
+    pub fn is_ready(&self) -> bool {
+        !self.cookie_header.is_empty() && !self.sub_id.is_empty()
+    }
+}
+
+/// Run the three-step login flow, returning a fresh [`AuthState`] (with
+/// `epoch = 0`; the caller increments it).
+pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthState> {
+    let login_url = format!("{}/ETITlogin.aspx", cfg.etit_login_url);
+
+    // ---- Step 1: GET login page ---------------------------------------------
+    let get_resp = http
+        .get(&login_url)
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(ACCEPT, "text/html,application/xhtml+xml")
+        .header(ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await
+        .context("GET ETITlogin.aspx")?;
+
+    if !get_resp.status().is_success() {
+        return Err(anyhow!("login page returned {}", get_resp.status()));
+    }
+
+    let get_headers = get_resp.headers().clone();
+    let html = get_resp.text().await.context("read login page body")?;
+
+    let viewstate = scrape(&html, &VIEWSTATE_RE_FWD, &VIEWSTATE_RE_REV)
+        .ok_or_else(|| anyhow!("could not scrape __VIEWSTATE"))?;
+    let generator = scrape(&html, &GENERATOR_RE_FWD, &GENERATOR_RE_REV)
+        .ok_or_else(|| anyhow!("could not scrape __VIEWSTATEGENERATOR"))?;
+
+    // ---- Step 2: POST credentials ------------------------------------------
+    let form: Vec<(&str, &str)> = vec![
+        ("ScriptManager1",        "UpdatePanel1|lg_AltairLogin$LoginButton"),
+        ("__EVENTTARGET",         "lg_AltairLogin$LoginButton"),
+        ("__VIEWSTATE",           &viewstate),
+        ("__VIEWSTATEGENERATOR",  &generator),
+        ("lg_AltairLogin$UserName", &cfg.etit_username),
+        ("lg_AltairLogin$Password", &cfg.etit_password),
+        ("__ASYNCPOST",           "true"),
+        ("RadAJAXControlID",      "RadAjaxManager1"),
+    ];
+
+    let post_resp = http
+        .post(&login_url)
+        .header(REFERER, &login_url)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded; charset=UTF-8")
+        .header("X-MicrosoftAjax", "Delta=true")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .form(&form)
+        .send()
+        .await
+        .context("POST ETITlogin.aspx")?;
+
+    let post_status        = post_resp.status();
+    let post_headers       = post_resp.headers().clone();
+    let post_body          = post_resp.text().await.unwrap_or_default();
+
+    if !post_status.is_success() && !post_status.is_redirection() {
+        return Err(anyhow!(
+            "login POST returned {}: {}",
+            post_status,
+            truncate(&post_body, 400)
+        ));
+    }
+
+    // ---- Step 3: follow ScriptManager pageRedirect -------------------------
+    let redirect_path = extract_page_redirect(&post_body);
+    let target = redirect_path
+        .as_deref()
+        .unwrap_or("WebPages/Transporters/List.aspx")
+        .trim_start_matches('/');
+    let follow_url = format!("{}/{}", cfg.etit_login_url, target);
+
+    tracing::debug!(url = %follow_url, "following pageRedirect after login POST");
+
+    let redirect_resp = http
+        .get(&follow_url)
+        .header(REFERER, &login_url)
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(ACCEPT, "text/html,application/xhtml+xml,*/*")
+        .send()
+        .await
+        .context("GET post-login redirect")?;
+
+    let redirect_headers = redirect_resp.headers().clone();
+    let sso_cookie = extract_set_cookie(&redirect_headers, "SSOCookie")
+        .or_else(|| extract_set_cookie(&post_headers, "SSOCookie"))
+        .unwrap_or_default();
+
+    if sso_cookie.is_empty() {
+        let seen_cookies: Vec<String> = redirect_resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.split(';').next().unwrap_or(s).to_string())
+            .collect();
+        return Err(anyhow!(
+            "SSOCookie missing. Cookies on redirect GET: {seen_cookies:?}. \
+             Post body: {}",
+            truncate(&post_body, 200)
+        ));
+    }
+
+    // Collect all cookies from all steps.
+    let mut all_cookies = std::collections::HashMap::new();
+    
+    // Helper to merge cookies from a HeaderMap.
+    let mut merge = |h: &reqwest::header::HeaderMap| {
+        for val in h.get_all(reqwest::header::SET_COOKIE).iter() {
+            if let Ok(s) = val.to_str() {
+                if let Some(pair) = s.split(';').next() {
+                    let mut parts = pair.splitn(2, '=');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                        all_cookies.insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                }
+            }
+        }
+    };
+
+    merge(&get_headers);
+    merge(&post_headers);
+    merge(&redirect_headers);
+
+    let cookie_header = all_cookies
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let (sub_id, staff_id) = parse_sso_cookie(&sso_cookie).ok_or_else(|| {
+        anyhow!(
+            "could not extract subID/staffID from SSOCookie: {}",
+            truncate(&sso_cookie, 200)
+        )
+    })?;
+
+    Ok(AuthState {
+        sub_id,
+        staff_id,
+        epoch: 0,
+        cookie_header,
+        last_login_at: Some(crate::domain::utc_now()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn extract_set_cookie(
+    headers: &reqwest::header::HeaderMap,
+    name: &str,
+) -> Option<String> {
+    let prefix = format!("{name}=");
+    for val in headers.get_all(reqwest::header::SET_COOKIE).iter() {
+        let s = val.to_str().unwrap_or("");
+        let pair = s.split(';').next().unwrap_or("").trim();
+        if let Some(value) = pair.strip_prefix(&prefix) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Pull the path out of an ASP.NET partial-postback `pageRedirect` directive.
+/// Format: `1|#||4|38|pageRedirect||%2fWebPages%2fSomePage.aspx|`.
+pub(crate) fn extract_page_redirect(body: &str) -> Option<String> {
+    let idx = body.find("pageRedirect")?;
+    let after = &body[idx..];
+    let mut parts = after.splitn(5, '|');
+    parts.next()?; // "pageRedirect"
+    parts.next()?; // ""
+    let encoded = parts.next()?.trim();
+    if encoded.is_empty() {
+        return None;
+    }
+    Some(
+        percent_encoding::percent_decode_str(encoded)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
+}
+
+pub(crate) fn scrape(html: &str, primary: &Regex, fallback: &Regex) -> Option<String> {
+    primary
+        .captures(html)
+        .or_else(|| fallback.captures(html))
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+}
+
+pub(crate) fn parse_sso_cookie(raw: &str) -> Option<(String, String)> {
+    let decoded = percent_encoding::percent_decode_str(raw)
+        .decode_utf8_lossy()
+        .into_owned();
+
+    // The SSOCookie is a *-delimited string.
+    // Based on empirical observation:
+    // index 1: subID
+    // index 12: staffID
+    let parts: Vec<&str> = decoded.split('*').collect();
+    if parts.len() > 12 {
+        let sub = parts[1].to_string();
+        let staff = parts[12].to_string();
+        // Basic sanity check: they should look like GUIDs.
+        if GUID_RE.is_match(&sub) && GUID_RE.is_match(&staff) {
+            return Some((sub, staff));
+        }
+    }
+
+    // Fallback: search for subid=... or staffid=...
+    let sub = SUBID_RE.captures(&decoded).and_then(|c| c.get(1)).map(|m| m.as_str().to_string());
+    let staff = STAFFID_RE.captures(&decoded).and_then(|c| c.get(1)).map(|m| m.as_str().to_string());
+    if let (Some(s), Some(t)) = (sub.clone(), staff.clone()) {
+        return Some((s, t));
+    }
+
+    // Fallback: positional, deduped.
+    let mut distinct: Vec<String> = Vec::new();
+    for m in GUID_RE.find_iter(&decoded) {
+        let g = m.as_str().to_string();
+        if !distinct.contains(&g) {
+            distinct.push(g);
+        }
+    }
+    match (sub, staff, distinct.as_slice()) {
+        (Some(s), None, [_, second, ..])           => Some((s, second.clone())),
+        (None,    Some(t), [first, ..])            => Some((first.clone(), t)),
+        (None,    None, [first, second, ..])       => Some((first.clone(), second.clone())),
+        _                                          => None,
+    }
+}
+
+pub(crate) fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n]) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_page_redirect_path() {
+        let body = "1|#||4|38|pageRedirect||%2fWebPages%2fTransporters%2fList.aspx|";
+        assert_eq!(
+            extract_page_redirect(body).as_deref(),
+            Some("/WebPages/Transporters/List.aspx"),
+        );
+    }
+
+    #[test]
+    fn parses_named_sso_cookie() {
+        let raw = "userid=abc&subID=ca53d5de-cf14-ea11-80ee-0025b500010d&\
+                   staffID=11111111-2222-3333-4444-555555555555&exp=2026";
+        let (s, t) = parse_sso_cookie(raw).unwrap();
+        assert_eq!(s, "ca53d5de-cf14-ea11-80ee-0025b500010d");
+        assert_eq!(t, "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn parses_positional_sso_cookie() {
+        let raw = "ca53d5de-cf14-ea11-80ee-0025b500010d|\
+                   11111111-2222-3333-4444-555555555555|extra";
+        let (s, t) = parse_sso_cookie(raw).unwrap();
+        assert_eq!(s, "ca53d5de-cf14-ea11-80ee-0025b500010d");
+        assert_eq!(t, "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn scrapes_either_attr_order() {
+        let a = r#"<input id="__VIEWSTATE" value="ABC" />"#;
+        let b = r#"<input value="ABC" id="__VIEWSTATE" />"#;
+        assert_eq!(scrape(a, &VIEWSTATE_RE_FWD, &VIEWSTATE_RE_REV).as_deref(), Some("ABC"));
+        assert_eq!(scrape(b, &VIEWSTATE_RE_FWD, &VIEWSTATE_RE_REV).as_deref(), Some("ABC"));
+    }
+}
+
+
+--- FILE: src/upstream/mod.rs ---
+//! Integration with the legacy ETIT ASP.NET system.
+//!
+//! Submodules:
+//! - [`auth`]      — login flow, ASP.NET WebForms scraping, cross-domain
+//!                   cookie capture, session epoch
+//! - [`client`]    — auth-aware reqwest wrapper used by every data call
+//! - [`vehicles`]  — `/WebPages/maps.aspx/GetTransportersPage`
+//! - [`live`]      — `/WebPages/GetTransportersSpeedStatus.aspx`
+//! - [`history`]   — `/WebPages/GetAllHistoryData.aspx`
+//! - [`parsers`]   — string-format helpers shared by the above
+
+pub mod auth;
+pub mod client;
+pub mod history;
+pub mod live;
+pub mod parsers;
+pub mod vehicles;
+
+pub use client::EtitClient;
+
+
+--- FILE: src/upstream/history.rs ---
+//! Integration C — route history via `/WebPages/GetAllHistoryData.aspx`.
+//!
+//! The upstream expects `M/D/YYYY HH:MM:SS` *in its own timezone*.
+
+use serde::Deserialize;
+
+use crate::domain::history::{SensorEvent, Stop};
+use crate::domain::time::{etit_format_for_history, parse_etit_local, Timestamp};
+use crate::domain::HistoryPoint;
+use crate::error::AppError;
+
+use super::client::EtitClient;
+use super::parsers::{fix_unquoted_json_keys, pct, truncate_for_log};
+
+const PATH: &str = "/WebPages/GetAllHistoryData.aspx";
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum Envelope {
+    Wrapped {
+        #[serde(default)]
+        history: Vec<Row>,
+        #[serde(default)]
+        stops: Vec<StopRow>,
+        #[serde(default, rename = "Sensors")]
+        sensors: Vec<SensorRow>,
+    },
+    Array(Vec<Row>),
+}
+
+impl Envelope {
+    fn into_parts(self) -> (Vec<Row>, Vec<StopRow>, Vec<SensorRow>) {
+        match self {
+            Envelope::Wrapped {
+                history,
+                stops,
+                sensors,
+            } => (history, stops, sensors),
+            Envelope::Array(rows) => (rows, Vec::new(), Vec::new()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Row {
+    #[serde(default)] p: Vec<Pt>,
+    #[serde(default)] d: String,
+    #[serde(default)] s: String,
+    #[serde(default)] l: String,
+    #[serde(flatten)] _extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Pt {
+    #[serde(default)] a: String,
+    #[serde(default)] o: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StopRow {
+    lat: String,
+    lon: String,
+    from: String,
+    to: String,
+    duration: String,
+    #[serde(default)]
+    address: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SensorRow {
+    lat: String,
+    lon: String,
+    #[serde(rename = "strtDate")]
+    start_date: String,
+    #[serde(rename = "typeName")]
+    type_name: String,
+}
+
+pub struct UpstreamHistory {
+    pub points: Vec<HistoryPoint>,
+    pub stops: Vec<Stop>,
+    pub sensors: Vec<SensorEvent>,
+}
+
+/// Fetch a range of history. `from` and `to` are UTC; we convert to the
+/// proxy's configured timezone for the upstream call.
+pub async fn fetch_range(
+    client: &EtitClient,
+    vehicle_id: &str,
+    from: Timestamp,
+    to: Timestamp,
+) -> Result<UpstreamHistory, AppError> {
+    if vehicle_id.is_empty() {
+        return Err(AppError::BadRequest("vehicle id required".into()));
+    }
+    let tz = client.config().timezone;
+
+    let from_str = etit_format_for_history(from, tz);
+    let to_str = etit_format_for_history(to, tz);
+
+    let path = format!(
+        "{PATH}?id={id}&time=6&points=1&from={from_q}&to={to_q}",
+        id = pct(vehicle_id),
+        from_q = pct(&from_str),
+        to_q = pct(&to_str),
+    );
+
+    let resp = client.get(&path).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::UpstreamStatus {
+            status: status.as_u16(),
+            body: truncate_for_log(&body, 400),
+        });
+    }
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| AppError::Parse(format!("history read: {e}")))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(UpstreamHistory {
+            points: Vec::new(),
+            stops: Vec::new(),
+            sensors: Vec::new(),
+        });
+    }
+
+    // Try strict parse first; fall back to the "fixed" version only when
+    // the strict parser fails — avoids unnecessary regex work.
+    let v: serde_json::Value = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) => v,
+        Err(_) => {
+            let fixed = fix_unquoted_json_keys(trimmed);
+            serde_json::from_str(&fixed).map_err(|e| {
+                tracing::error!(
+                    vehicle_id,
+                    body = %truncate_for_log(&fixed, 400),
+                    "history JSON parse failed even after fix"
+                );
+                AppError::Parse(format!("history JSON: {e}"))
+            })?
+        }
+    };
+
+    let envelope: Envelope = serde_json::from_value(v)
+        .map_err(|e| AppError::Parse(format!("history structural: {e}")))?;
+
+    Ok(flatten(envelope, tz))
+}
+
+fn flatten(env: Envelope, tz: chrono_tz::Tz) -> UpstreamHistory {
+    let (history_rows, stop_rows, sensor_rows) = env.into_parts();
+
+    let mut points = Vec::new();
+    for row in history_rows {
+        let speed = row
+            .s
+            .parse::<f64>()
+            .ok()
+            .map(|f| f.max(0.0).round() as u32)
+            .unwrap_or(0);
+        let speed_limit = row
+            .l
+            .parse::<f64>()
+            .ok()
+            .map(|f| f.max(0.0).round() as u32)
+            .unwrap_or(0);
+        let timestamp = parse_etit_local(&row.d, tz);
+
+        for pt in row.p {
+            let lat = pt.a.parse::<f64>().unwrap_or(0.0);
+            let lng = pt.o.parse::<f64>().unwrap_or(0.0);
+            points.push(HistoryPoint {
+                lat,
+                lng,
+                timestamp,
+                speed,
+                speed_limit,
+            });
+        }
+    }
+
+    use crate::domain::history::{SensorEvent, Stop};
+
+    let mut stops = Vec::new();
+    for s in stop_rows {
+        let lat = s.lat.parse::<f64>().unwrap_or(0.0);
+        let lng = s.lon.parse::<f64>().unwrap_or(0.0);
+        let from = parse_etit_local(&s.from, tz).unwrap_or_default();
+        let to = parse_etit_local(&s.to, tz).unwrap_or_default();
+        stops.push(Stop {
+            lat,
+            lng,
+            from,
+            to,
+            duration: s.duration,
+            address: s.address,
+        });
+    }
+
+    let mut sensors = Vec::new();
+    for s in sensor_rows {
+        let lat = s.lat.parse::<f64>().unwrap_or(0.0);
+        let lng = s.lon.parse::<f64>().unwrap_or(0.0);
+        // Clean up "Start Time : 25/04/2026 01:06:34"
+        let date_str = s
+            .start_date
+            .split_once(':')
+            .map(|(_, d)| d.trim())
+            .unwrap_or(&s.start_date);
+        let timestamp = parse_etit_local(date_str, tz).unwrap_or_default();
+        sensors.push(SensorEvent {
+            lat,
+            lng,
+            timestamp,
+            type_name: s.type_name,
+        });
+    }
+
+    UpstreamHistory {
+        points,
+        stops,
+        sensors,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TripSummaryEnvelope {
+    #[serde(rename = "TripSummary")]
+    summary: Vec<TripSummaryRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TripSummaryRow {
+    total_mileage: String,
+    total_active_time: String,
+    total_passive_time: String,
+    total_idle_time: String,
+    driver_name: String,
+    #[serde(rename = "NumberofStops")]
+    number_of_stops: String,
+    #[serde(rename = "TotalDisConnectedTime")]
+    total_disconnected_time: String,
+    total_fuel_consumption: String,
+    sensor1: String, // e.g. "26#Ignition Off"
+    sensor2: String, // e.g. "25#Ignition On"
+}
+
+pub async fn fetch_trip_summary(
+    client: &EtitClient,
+    vehicle_id: &str,
+    from: Timestamp,
+    to: Timestamp,
+) -> Result<crate::domain::history::TripSummary, AppError> {
+    let tz = client.config().timezone;
+    let from_str = etit_format_for_history(from, tz);
+    let to_str = etit_format_for_history(to, tz);
+
+    let path = format!(
+        "/WebPages/GetHistoryTripSummary.ashx?id={id}&time=6&from={from_q}&to={to_q}&t={t}",
+        id = pct(vehicle_id),
+        from_q = pct(&from_str),
+        to_q = pct(&to_str),
+        t = chrono::Utc::now().timestamp_millis(),
+    );
+
+    let resp = client.get(&path).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::UpstreamStatus {
+            status: status.as_u16(),
+            body: truncate_for_log(&body, 400),
+        });
+    }
+
+    let raw = resp
+        .text()
+        .await
+        .map_err(|e| AppError::Parse(format!("summary read: {e}")))?;
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(crate::domain::history::TripSummary::default());
+    }
+
+    // ETIT returns "TripSummary:[...]" without braces and with unquoted keys.
+    let wrapped = if !trimmed.starts_with('{') {
+        format!("{{ {trimmed} }}")
+    } else {
+        trimmed.to_string()
+    };
+    let fixed = fix_unquoted_json_keys(&wrapped);
+
+    let envelope: TripSummaryEnvelope = serde_json::from_str(&fixed).map_err(|e| {
+        tracing::error!(
+            vehicle_id,
+            body = %truncate_for_log(&fixed, 400),
+            "trip summary JSON parse failed"
+        );
+        AppError::Parse(format!("summary JSON: {e}"))
+    })?;
+
+    let row = envelope.summary.into_iter().next().ok_or_else(|| {
+        AppError::Parse("empty trip summary array".into())
+    })?;
+
+    use crate::domain::history::TripSummary;
+
+    Ok(TripSummary {
+        total_mileage: row.total_mileage,
+        total_active_time: row.total_active_time,
+        total_passive_time: row.total_passive_time,
+        total_idle_time: row.total_idle_time,
+        driver_name: row.driver_name,
+        number_of_stops: row.number_of_stops,
+        total_disconnected_time: row.total_disconnected_time,
+        total_fuel_consumption: row.total_fuel_consumption,
+        ignition_off_count: row.sensor1.split('#').next().unwrap_or("0").to_string(),
+        ignition_on_count: row.sensor2.split('#').next().unwrap_or("0").to_string(),
+    })
+}
+
+
+--- FILE: src/upstream/live.rs ---
+//! Integration B — live vehicle status via
+//! `/WebPages/GetTransportersSpeedStatus.aspx`.
+//!
+//! The upstream returns an asterisk-delimited columnar block:
+//!
+//! ```text
+//! ids * speeds * statuses * lngs * lats * times * <extras…>
+//! ```
+//!
+//! Required columns are 0..=5. Beyond that the layout has shifted across
+//! deployments — so instead of hard-coding column indices for events and
+//! sensor data, we **scan** every later column row-by-row and pick the
+//! first row-cell that:
+//!
+//! - matches a `\d+#.+` shape → treat as an event (e.g. `4#Ignition On`).
+//! - else, the first non-empty cell becomes `sensor_data`.
+//!
+//! This insulates us from upstream column reshuffles.
+
+use chrono_tz::Tz;
+use once_cell::sync::Lazy;
+use regex::Regex;
+
+use crate::domain::{status_label, time::parse_etit_local, LiveVehicleStatus, Vehicle};
+use crate::error::AppError;
+
+use super::client::EtitClient;
+use super::parsers::truncate_for_log;
+
+const PATH: &str = "/WebPages/GetTransportersSpeedStatus.aspx";
+
+static EVENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d+#.+").unwrap());
+
+pub async fn fetch_live(
+    client: &EtitClient,
+    vehicles: &[Vehicle],
+) -> Result<Vec<LiveVehicleStatus>, AppError> {
+    if vehicles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let payload = build_ids_speedlimits(vehicles);
+    let form = vec![("ids_speedlimits".to_string(), payload)];
+
+    let resp = client.post_form(PATH, form).await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::UpstreamStatus {
+            status: status.as_u16(),
+            body:   truncate_for_log(&body, 400),
+        });
+    }
+    let raw = resp.text().await?;
+    parse_live(&raw, client.config().timezone, vehicles)
+}
+
+/// Build `id|limit|1,id|limit|1,…`. The trailing `|1` flag is required to
+/// force coordinate inclusion in the response.
+pub(crate) fn build_ids_speedlimits(vehicles: &[Vehicle]) -> String {
+    let mut s = String::with_capacity(vehicles.len() * 64);
+    for (i, v) in vehicles.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str(&v.id);
+        s.push('|');
+        s.push_str(&v.speed_limit.to_string());
+        s.push('|');
+        s.push('1');
+    }
+    s
+}
+
+pub(crate) fn parse_live(
+    raw: &str,
+    tz: Tz,
+    vehicles: &[Vehicle],
+) -> Result<Vec<LiveVehicleStatus>, AppError> {
+    let raw = raw.trim();
+    if raw.is_empty() { return Ok(Vec::new()); }
+
+    let cols: Vec<Vec<&str>> = raw
+        .split('*')
+        .map(|c| c.split(',').map(|s| s.trim()).collect())
+        .collect();
+
+    if cols.len() < 6 {
+        return Err(AppError::Parse(format!(
+            "live response has {} columns, need ≥ 6",
+            cols.len()
+        )));
+    }
+
+    let row_count = cols[0].len();
+    for (name, idx) in [("speeds", 1), ("statuses", 2), ("lngs", 3), ("lats", 4), ("times", 5)] {
+        if cols[idx].len() != row_count {
+            return Err(AppError::Parse(format!(
+                "live column `{name}` has {} rows but ids has {}",
+                cols[idx].len(), row_count
+            )));
+        }
+    }
+
+    // Plate lookup so the live response carries plates without a join.
+    let plate_by_id: std::collections::HashMap<&str, &str> = vehicles
+        .iter()
+        .map(|v| (v.id.as_str(), v.plate.as_str()))
+        .collect();
+
+    let mut out = Vec::with_capacity(row_count);
+
+    for i in 0..row_count {
+        let id = cols[0][i].to_string();
+        if id.is_empty() { continue; }
+
+        let speed         = cols[1][i].parse::<i32>().unwrap_or(0);
+        let status        = cols[2][i].parse::<i32>().unwrap_or(0);
+        let status_label_ = status_label(status).to_string();
+        let lng           = cols[3][i].parse::<f64>().unwrap_or(0.0);
+        let lat           = cols[4][i].parse::<f64>().unwrap_or(0.0);
+        let timestamp     = parse_etit_local(cols[5][i], tz);
+
+        // Scan extra columns for this row.
+        let mut event:       Option<String> = None;
+        let mut sensor_data: Option<String> = None;
+        for col in cols.iter().skip(6) {
+            let cell = col.get(i).copied().unwrap_or("").trim();
+            if cell.is_empty() { continue; }
+            if event.is_none() && EVENT_RE.is_match(cell) {
+                // Strip the leading "<digits>#" prefix for display.
+                if let Some(idx) = cell.find('#') {
+                    event = Some(cell[idx + 1..].trim().to_string());
+                } else {
+                    event = Some(cell.to_string());
+                }
+            } else if sensor_data.is_none() {
+                sensor_data = Some(cell.to_string());
+            }
+        }
+
+        let plate = plate_by_id.get(id.as_str()).map(|p| p.to_string()).filter(|p| !p.is_empty());
+
+        out.push(LiveVehicleStatus {
+            id,
+            plate,
+            speed,
+            status,
+            status_label: status_label_,
+            lat,
+            lng,
+            timestamp,
+            event,
+            sensor_data,
+        });
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Vehicle;
+
+    fn v(id: &str, plate: &str, limit: u32) -> Vehicle {
+        Vehicle {
+            id: id.into(),
+            codename: format!("OL/{plate}"),
+            plate: plate.into(),
+            speed_limit: limit,
+            online: true,
+            speed: 0,
+            status: 1,
+            status_label: "Moving".into(),
+            last_location_at: None,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ids_speedlimits_format() {
+        let vs = vec![v("a", "ABC", 70), v("b", "XYZ", 80)];
+        assert_eq!(build_ids_speedlimits(&vs), "a|70|1,b|80|1");
+    }
+
+    #[test]
+    fn parses_two_row_payload_with_event_at_col_9() {
+        let raw = "0ed629a4-aaaa,19cdd2ad-bbbb*\
+                   8,52*\
+                   1,1*\
+                   33.923,33.924*\
+                   26.843,26.844*\
+                   26 April 2026 16:28,26 April 2026 16:28*\
+                   -1,-1*\
+                   0.1,0.1*\
+                   -1,-1*\
+                   4#Ignition On,4#Ignition On";
+        let vs = vec![v("0ed629a4-aaaa", "P1", 80), v("19cdd2ad-bbbb", "P2", 80)];
+        let out = parse_live(raw, chrono_tz::Africa::Cairo, &vs).expect("parse");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "0ed629a4-aaaa");
+        assert_eq!(out[0].speed, 8);
+        assert_eq!(out[0].status, 1);
+        assert_eq!(out[0].status_label, "Moving");
+        assert!((out[0].lat - 26.843).abs() < 1e-6);
+        assert!((out[0].lng - 33.923).abs() < 1e-6);
+        assert_eq!(out[0].plate.as_deref(), Some("P1"));
+        assert_eq!(out[0].event.as_deref(), Some("Ignition On"));
+        assert!(out[0].timestamp.is_some());
+    }
+
+    #[test]
+    fn empty_input_yields_empty() {
+        assert!(parse_live("", chrono_tz::UTC, &[]).unwrap().is_empty());
+    }
+}
+
+
+--- FILE: src/upstream/vehicles.rs ---
+//! Integration A — vehicle metadata via
+//! `/WebPages/maps.aspx/GetTransportersPage`.
+
+use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::domain::{status_label, time::parse_etit_local, Vehicle};
+use crate::error::AppError;
+
+use super::client::EtitClient;
+use super::parsers::truncate_for_log;
+
+const PATH: &str = "/WebPages/maps.aspx/GetTransportersPage";
+
+/// Cap to defend against a buggy upstream returning a non-empty `d` forever.
+const PAGE_HARD_CAP: u32 = 200;
+
+#[derive(Debug, Clone, Serialize)]
+struct PageRequest {
+    #[serde(rename = "pageNumber")]   page_number: u32,
+    #[serde(rename = "filterCategory")] filter_category: &'static str,
+    #[serde(rename = "filterValue")]    filter_value: &'static str,
+    #[serde(rename = "filterText")]     filter_text: &'static str,
+    #[serde(rename = "subID")]          sub_id: String,
+    #[serde(rename = "staffID")]        staff_id: String,
+}
+
+/// Raw upstream row. Every field arrives as a string.
+#[derive(Debug, Clone, Deserialize)]
+struct UpstreamRow {
+    #[serde(rename = "ID", default)]               id: String,
+    #[serde(rename = "codename", default)]         codename: String,
+    #[serde(rename = "SpeedLimit", default)]       speed_limit: Option<String>,
+    #[serde(rename = "OnlineFlag", default)]       online_flag: Option<String>,
+    #[serde(rename = "Speed", default)]            speed: Option<String>,
+    #[serde(rename = "Status", default)]           status: Option<String>,
+    #[serde(rename = "LastLocationDate", default)] last_location_date: Option<String>,
+    #[serde(flatten)]                              extra: serde_json::Map<String, Value>,
+}
+
+pub async fn fetch_all(client: &EtitClient) -> Result<Vec<Vehicle>, AppError> {
+    let auth = client.auth_snapshot().await;
+    let auth = if !auth.is_ready() {
+        client.force_login().await?;
+        client.auth_snapshot().await
+    } else {
+        auth
+    };
+
+    let tz = client.config().timezone;
+    let mut all = Vec::new();
+
+    for page in 1..=PAGE_HARD_CAP {
+        let req = PageRequest {
+            page_number:     page,
+            filter_category: "Default",
+            filter_value:    "",
+            filter_text:     "",
+            sub_id:          auth.sub_id.clone(),
+            staff_id:        auth.staff_id.clone(),
+        };
+
+        let resp = client.post_json(PATH, req).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::UpstreamStatus {
+                status: status.as_u16(),
+                body:   truncate_for_log(&body, 400),
+            });
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| AppError::Parse(format!("vehicles page {page} read: {e}")))?;
+
+        let envelope: Value = serde_json::from_str(&body)
+            .map_err(|e| AppError::Parse(format!("vehicles page {page} envelope: {e}")))?;
+
+        let d_val = envelope
+            .get("d")
+            .ok_or_else(|| {
+                AppError::Parse(format!("vehicles page {page} missing `d`"))
+            })?;
+
+        if d_val.is_null() {
+            break;
+        }
+        let d_str = d_val
+            .as_str()
+            .ok_or_else(|| AppError::Parse(format!("vehicles page {page} `d` not string")))?;
+        let trimmed = d_str.trim();
+        if trimmed.is_empty() || trimmed == "[]" || trimmed == "null" {
+            break;
+        }
+
+        let rows: Vec<UpstreamRow> = serde_json::from_str(trimmed)
+            .map_err(|e| AppError::Parse(format!("vehicles page {page} inner: {e}")))?;
+
+        if rows.is_empty() {
+            break;
+        }
+        all.extend(rows.into_iter().map(|r| convert(r, tz)));
+    }
+
+    tracing::info!(count = all.len(), "fetched vehicles");
+    Ok(all)
+}
+
+fn convert(row: UpstreamRow, tz: Tz) -> Vehicle {
+    let speed_limit = row.speed_limit.as_deref().and_then(parse_u32).unwrap_or(0);
+    let online      = row.online_flag.as_deref().map(parse_bool).unwrap_or(false);
+    let speed       = row.speed.as_deref().and_then(parse_u32).unwrap_or(0);
+    let status      = row.status.as_deref().and_then(parse_i32).unwrap_or(0);
+    let status_label_str = status_label(status).to_string();
+
+    let last_location_at = row
+        .last_location_date
+        .as_deref()
+        .and_then(|s| parse_etit_local(s, tz));
+
+    let (_, plate) = Vehicle::split_codename(&row.codename);
+    let plate_str = plate.to_string();
+
+    let extra = row.extra.into_iter().map(|(k, v)| (k, coerce(v))).collect();
+
+    Vehicle {
+        id:               row.id,
+        codename:         row.codename,
+        plate:            plate_str,
+        speed_limit,
+        online,
+        speed,
+        status,
+        status_label:     status_label_str,
+        last_location_at,
+        extra,
+    }
+}
+
+fn parse_u32(s: &str) -> Option<u32> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    s.parse::<u32>()
+        .ok()
+        .or_else(|| s.parse::<f64>().ok().map(|f| f.max(0.0).round() as u32))
+}
+
+fn parse_i32(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    s.parse::<i32>()
+        .ok()
+        .or_else(|| s.parse::<f64>().ok().map(|f| f.round() as i32))
+}
+
+fn parse_bool(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+}
+
+fn coerce(v: Value) -> Value {
+    match v {
+        Value::String(s) => {
+            let t = s.trim();
+            if t.eq_ignore_ascii_case("true")  { return Value::Bool(true);  }
+            if t.eq_ignore_ascii_case("false") { return Value::Bool(false); }
+            if let Ok(n) = t.parse::<i64>()    { return Value::from(n);     }
+            if let Ok(n) = t.parse::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(n) {
+                    return Value::Number(num);
+                }
+            }
+            Value::String(s)
+        }
+        other => other,
+    }
+}
+
+
+--- FILE: src/pollers/tier_a.rs ---
+//! Tier A — periodic vehicle metadata refresh.
+
+use std::sync::Arc;
+
+use tokio::time::{interval, MissedTickBehavior};
+
+use super::Pollers;
+
+pub async fn run(p: Arc<Pollers>) {
+    let mut tick = interval(p.cfg.tier_a_refresh);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match p.vehicles.refresh_now().await {
+            Ok(list) => tracing::info!(count = list.len(), "tier A refreshed"),
+            Err(e)   => tracing::warn!(error = %e, "tier A refresh failed"),
+        }
+    }
+}
+
+
+--- FILE: src/pollers/tier_c.rs ---
+//! Tier C — hot-history poller.
+//!
+//! Every `tier_c_poll` interval:
+//!   1. Cool any DB rows whose `is_hot` flag is no longer accurate (the
+//!      calendar may have rolled over since the previous tick).
+//!   2. For every known vehicle, refresh today + yesterday in parallel,
+//!      bounded by `tier_c_concurrency`.
+
+use std::sync::Arc;
+
+use tokio::sync::Semaphore;
+use tokio::time::{interval, MissedTickBehavior};
+
+use crate::domain::time::today_local;
+
+use super::Pollers;
+
+pub async fn run(p: Arc<Pollers>) {
+    let mut tick = interval(p.cfg.tier_c_poll);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    let sem = Arc::new(Semaphore::new(p.cfg.tier_c_concurrency.max(1)));
+
+    loop {
+        tick.tick().await;
+
+        let tz = p.cfg.timezone;
+        let today = today_local(tz);
+        let yesterday = today.pred_opt().unwrap_or(today);
+
+        // Cool stale hot rows in the DB. Failure here is non-fatal —
+        // cool/hot is a polling hint, not a correctness invariant.
+        if let Err(e) = p.history_repo.cool_aged_hot_rows(today, yesterday).await {
+            tracing::warn!(error = %e, "cool_aged_hot_rows failed");
+        }
+
+        // Snapshot the vehicle list for this tick.
+        let vehicles = match p.vehicles.list().await {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(error = %e, "tier C: could not list vehicles");
+                continue;
+            }
+        };
+
+        // Fan out concurrently, capped by the semaphore.
+        let mut handles = Vec::with_capacity(vehicles.len() * 2);
+        for v in vehicles.iter() {
+            for date in [today, yesterday] {
+                let svc = p.history.clone();
+                let sem = sem.clone();
+                let vid = v.id.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    if let Err(e) = svc.for_day(&vid, date, true).await {
+                        tracing::debug!(vehicle = %vid, %date, error = %e, "tier C day refresh failed");
+                    }
+                }));
+            }
+        }
+
+        // Wait for the entire round to finish before the next tick.
+        for h in handles {
+            let _ = h.await;
+        }
+        tracing::info!(
+            vehicles = vehicles.len(),
+            "tier C refresh completed (today + yesterday)"
+        );
+    }
+}
+
+
+--- FILE: src/pollers/mod.rs ---
+//! Background pollers.
+//!
+//! Three workers, each driven by `tokio::time::interval`:
+//!
+//! - **Tier A** — refresh vehicle metadata (default every 24h, configurable).
+//! - **Tier B** — refresh live status every minute and broadcast.
+//! - **Tier C** — every 30 minutes, refresh today + yesterday history for
+//!   every known vehicle, with a semaphore-bounded fan-out so we don't
+//!   thunder-storm the upstream.
+//!
+//! Workers never hold any synchronous lock across an await. They go through
+//! the same auth-aware client as user requests, so the auth Mutex is the
+//! only synchronization point and it's only held during the actual login
+//! flow.
+
+mod tier_a;
+mod tier_b;
+mod tier_c;
+
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::db::HistoryRepo;
+use crate::services::broadcaster::Broadcaster;
+use crate::services::history::HistoryService;
+use crate::services::live::LiveService;
+use crate::services::vehicles::VehiclesService;
+
+pub struct Pollers {
+    pub cfg: Config,
+    pub vehicles: Arc<VehiclesService>,
+    pub live: Arc<LiveService>,
+    pub history: Arc<HistoryService>,
+    pub history_repo: HistoryRepo,
+    pub broadcaster: Arc<Broadcaster>,
+}
+
+impl Pollers {
+    pub fn spawn_all(self: Arc<Self>) {
+        {
+            let p = self.clone();
+            tokio::spawn(async move { tier_a::run(p).await; });
+        }
+        {
+            let p = self.clone();
+            tokio::spawn(async move { tier_b::run(p).await; });
+        }
+        {
+            let p = self.clone();
+            tokio::spawn(async move { tier_c::run(p).await; });
+        }
+    }
+}
+
+
+--- FILE: src/pollers/tier_b.rs ---
+//! Tier B — live-status poller.
+//!
+//! Refreshes the live snapshot every minute (configurable). After each
+//! successful refresh, publishes the new snapshot on the broadcaster so SSE
+//! subscribers get a push.
+
+use std::sync::Arc;
+
+use tokio::time::{interval, MissedTickBehavior};
+
+use crate::services::broadcaster::LiveEvent;
+
+use super::Pollers;
+
+pub async fn run(p: Arc<Pollers>) {
+    let mut tick = interval(p.cfg.tier_b_poll);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        match p.live.refresh_now().await {
+            Ok(snap) => {
+                let count = snap.by_id.len();
+                p.broadcaster.publish(LiveEvent::Update(snap));
+                tracing::debug!(count, "tier B refreshed");
+            }
+            Err(e) => tracing::warn!(error = %e, "tier B refresh failed"),
+        }
+    }
+}
+
+
+--- FILE: Cargo.toml ---
+[package]
+name        = "etit-proxy"
+version     = "0.2.0"
+edition     = "2021"
+authors     = ["Apex Transport"]
+description = "Rust middleware bridging React/Google Maps to legacy ETIT ASP.NET tracking — v2"
+license     = "MIT"
+
+[dependencies]
+# ---- Web framework ----------------------------------------------------------
+axum       = { version = "0.7", features = ["macros", "ws"] }
+tower      = { version = "0.5", features = ["util", "limit", "timeout"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip", "set-header", "request-id"] }
+
+# ---- Async runtime ----------------------------------------------------------
+tokio        = { version = "1.40", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures      = "0.3"
+
+# ---- HTTP client ------------------------------------------------------------
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "default-tls", "gzip", "cookies"
+] }
+
+# ---- Persistence (SQLite via sqlx) -----------------------------------------
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-native-tls", "sqlite", "chrono", "macros", "migrate"
+] }
+
+# ---- In-memory cache --------------------------------------------------------
+moka = { version = "0.12", features = ["future"] }
+
+# ---- Serialization ----------------------------------------------------------
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# ---- Time -------------------------------------------------------------------
+chrono    = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+
+# ---- Concurrency / data structures -----------------------------------------
+parking_lot = "0.12"
+dashmap     = "6.1"
+arc-swap    = "1.7"
+
+# ---- Utilities --------------------------------------------------------------
+anyhow            = "1.0"
+thiserror         = "1.0"
+regex             = "1.11"
+once_cell         = "1.20"
+url               = "2.5"
+percent-encoding  = "2.3"
+uuid              = { version = "1.10", features = ["v4", "serde"] }
+bytes             = "1.7"
+
+# ---- Logging ----------------------------------------------------------------
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# ---- Config -----------------------------------------------------------------
+dotenvy = "0.15"
+
+jsonwebtoken = "9"
+
+[dev-dependencies]
+tokio = { version = "1.40", features = ["test-util", "macros", "rt-multi-thread"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+panic         = "abort"
+
+[profile.dev]
+opt-level = 1
+
+

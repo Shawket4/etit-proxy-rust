@@ -1,0 +1,200 @@
+name: Build and Deploy etit-proxy-rust
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build in Docker (Ubuntu 22.04 - matches VPS)
+        env:
+          SQLX_OFFLINE: true
+        run: |
+          cat > Dockerfile.build << 'EOF'
+          FROM ubuntu:22.04
+
+          ENV DEBIAN_FRONTEND=noninteractive
+
+          RUN apt-get update && apt-get install -y \
+              curl \
+              build-essential \
+              pkg-config \
+              libssl-dev \
+              libsqlite3-dev \
+              ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+
+          RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          ENV PATH="/root/.cargo/bin:${PATH}"
+
+          WORKDIR /app
+          COPY . .
+
+          RUN cargo build --release --verbose
+          RUN strip target/release/etit-proxy || true
+          RUN ls -lh target/release/etit-proxy
+          EOF
+
+          docker build -t etit-proxy-builder -f Dockerfile.build .
+
+          docker create --name temp-container etit-proxy-builder
+          docker cp temp-container:/app/target/release/etit-proxy ./etit-proxy
+          docker rm temp-container
+
+          ls -la etit-proxy
+          file etit-proxy
+          chmod +x etit-proxy
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deployment
+
+          cp etit-proxy deployment/
+          cp -r migrations deployment/ || true
+          # Ship .env.example but never the real .env
+          cp .env.example deployment/.env.example || true
+
+          tar -czf deployment.tar.gz -C deployment .
+
+          echo "Deployment package contents:"
+          tar -tzf deployment.tar.gz
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy to VPS
+        run: |
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          DEPLOY_DIR="/opt/etit-proxy-rust"
+          SERVICE_NAME="etit-proxy-rust"
+          BACKUP_DIR="${DEPLOY_DIR}/backups"
+          DATA_DIR="${DEPLOY_DIR}/data"
+
+          echo "Starting etit-proxy deployment..."
+
+          sudo mkdir -p "${DEPLOY_DIR}"
+          sudo mkdir -p "${BACKUP_DIR}"
+          sudo mkdir -p "${DATA_DIR}"
+          sudo mkdir -p "${DEPLOY_DIR}/logs"
+
+          # ── Stop service ──────────────────────────────────────────────────
+          echo "Stopping service..."
+          sudo systemctl stop "${SERVICE_NAME}" || true
+
+          # ── Backup binary ─────────────────────────────────────────────────
+          if [ -f "${DEPLOY_DIR}/etit-proxy" ]; then
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            echo "Backing up binary (${TIMESTAMP})..."
+            sudo cp "${DEPLOY_DIR}/etit-proxy" "${BACKUP_DIR}/etit-proxy.${TIMESTAMP}"
+            # Keep only the last 5 backups
+            sudo ls -t "${BACKUP_DIR}"/etit-proxy.* 2>/dev/null | tail -n +6 | xargs -r sudo rm
+          fi
+
+          # ── Backup SQLite database ────────────────────────────────────────
+          # The database lives in data/ which is NOT in the deployment tarball,
+          # so it survives extraction — this backup is a safety net only.
+          if [ -f "${DATA_DIR}/etit.db" ]; then
+            echo "Backing up database..."
+            sudo cp "${DATA_DIR}/etit.db" "${BACKUP_DIR}/etit.db.${TIMESTAMP:-bak}"
+          fi
+
+          # ── Extract new files ─────────────────────────────────────────────
+          echo "Extracting deployment package..."
+          sudo tar -xzf /tmp/etit-deployment.tar.gz -C "${DEPLOY_DIR}"
+
+          sudo chmod +x "${DEPLOY_DIR}/etit-proxy"
+          sudo chown -R root:root "${DEPLOY_DIR}"
+          # data/ must be writable by the service user (root in this case)
+          sudo chmod 700 "${DATA_DIR}"
+
+          # ── Bootstrap .env if missing ─────────────────────────────────────
+          if [ ! -f "${DEPLOY_DIR}/.env" ]; then
+            if [ -f "${DEPLOY_DIR}/.env.example" ]; then
+              echo "Creating .env from .env.example — edit before restarting if needed"
+              sudo cp "${DEPLOY_DIR}/.env.example" "${DEPLOY_DIR}/.env"
+            else
+              echo "⚠️  No .env found — service may fail to start"
+            fi
+          else
+            echo ".env already exists, leaving untouched"
+          fi
+
+          # ── Restart service ───────────────────────────────────────────────
+          echo "Restarting service..."
+          sudo systemctl daemon-reload
+          sudo systemctl enable "${SERVICE_NAME}"
+          sudo systemctl restart "${SERVICE_NAME}"
+
+          sleep 3
+
+          if sudo systemctl is-active --quiet "${SERVICE_NAME}"; then
+            echo "✅ Service is running"
+            sudo systemctl status "${SERVICE_NAME}" --no-pager
+          else
+            echo "❌ Service failed to start — last 30 log lines:"
+            sudo journalctl -u "${SERVICE_NAME}" -n 30 --no-pager
+            exit 1
+          fi
+
+          echo "Deployment complete!"
+          EOF
+
+          chmod +x deploy.sh
+
+          echo "Uploading deployment package..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            deployment.tar.gz \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/etit-deployment.tar.gz
+
+          echo "Uploading deploy script..."
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            deploy.sh \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/tmp/etit-deploy.sh
+
+          echo "Running deploy script on VPS..."
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "bash /tmp/etit-deploy.sh"
+
+      - name: Health check
+        run: |
+          echo "Waiting for service to be ready..."
+          sleep 5
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "curl -sf http://127.0.0.1:3003/health && echo '✅ healthy' || echo '⚠️ health endpoint not available'"
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "systemctl status etit-proxy-rust --no-pager" || true
+
+      - name: Show recent logs
+        if: always()
+        run: |
+          echo "Recent service logs:"
+          ssh -i ~/.ssh/deploy_key -P ${{ secrets.SSH_PORT }} \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "sudo journalctl -u etit-proxy-rust -n 30 --no-pager" || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f ~/.ssh/deploy_key
+          echo "Cleaned up SSH keys"
