@@ -12,10 +12,12 @@ use std::str::FromStr;
 use std::time::Duration;
 
 pub mod history;
+pub mod trip_audit;
 pub mod vehicles;
 pub mod zones;
 
 pub use history::HistoryRepo;
+pub use trip_audit::TripAuditRepo;
 pub use vehicles::VehiclesRepo;
 pub use zones::ZonesRepo;
 

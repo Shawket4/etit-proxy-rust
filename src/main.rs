@@ -28,7 +28,7 @@ use etit_proxy::api;
 use etit_proxy::auth::require_admin;
 use etit_proxy::cache::CacheLayer;
 use etit_proxy::config::Config;
-use etit_proxy::db::{open_pool, HistoryRepo, VehiclesRepo, ZonesRepo};
+use etit_proxy::db::{open_pool, HistoryRepo, TripAuditRepo, VehiclesRepo, ZonesRepo};
 use etit_proxy::pollers::Pollers;
 use etit_proxy::zones::scan::spawn_zone_scanner;
 use etit_proxy::services::broadcaster::Broadcaster;
@@ -62,6 +62,22 @@ async fn main() -> anyhow::Result<()> {
     let pool = open_pool(&cfg.database_url).await?;
     let vehicles_repo = VehiclesRepo::new(pool.clone());
     let zones_repo = ZonesRepo::new(pool.clone());
+    let trip_repo = TripAuditRepo::new(pool.clone());
+
+    // ---- Apex Postgres (trip audit) — optional, read-only -------------------
+    let apex_db = match &cfg.apex_database_url {
+        Some(url) => match etit_proxy::trips::pg::ApexDb::connect(url).await {
+            Ok(db) => {
+                tracing::info!("apex Postgres connected; trip audit enabled");
+                Some(db)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "apex Postgres connection failed; trip audit disabled");
+                None
+            }
+        },
+        None => None,
+    };
 
     // ---- Upstream client ---------------------------------------------------
     let client = EtitClient::new(cfg.clone()).context("building EtitClient")?;
@@ -127,6 +143,13 @@ async fn main() -> anyhow::Result<()> {
         live:        live_svc.clone(),
         history:     history_svc.clone(),
         zones_repo:  zones_repo.clone(),
+        trip_repo:   trip_repo.clone(),
+        apex_db:     apex_db.clone(),
+        osrm:        etit_proxy::trips::osrm::OsrmClient::new(
+            http.clone(),
+            cfg.osrm_url.clone(),
+            cfg.osrm_exclude_class.clone(),
+        ),
         broadcaster: broadcaster.clone(),
         started_at:  Instant::now(),
     };
@@ -144,6 +167,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- Zones Scanner ----------------------------------------------------
     spawn_zone_scanner(state.clone());
+
+    // ---- Trip Audit Scanner -------------------------------------------------
+    etit_proxy::trips::scan::spawn_trip_scanner(state.clone());
 
     // ---- CORS -------------------------------------------------------------
     //

@@ -6,5 +6,6 @@ pub mod history;
 pub mod live;
 pub mod metrics;
 pub mod stream;
+pub mod trip_audit;
 pub mod vehicles;
 pub mod zones;

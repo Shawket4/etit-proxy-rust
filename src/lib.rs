@@ -26,3 +26,4 @@ pub mod state;
 pub mod upstream;
 pub mod auth;
 pub mod zones;
+pub mod trips;

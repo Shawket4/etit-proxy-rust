@@ -36,7 +36,14 @@ pub fn router(state: AppState) -> Router {
         .route("/stream/live",                  get(handlers::stream::live_sse))
         .route("/zones",                        get(handlers::zones::list).post(handlers::zones::create))
         .route("/zones/:id",                    get(handlers::zones::get_one).put(handlers::zones::update).delete(handlers::zones::delete))
-        .route("/zones/scan",                   post(handlers::zones::run_scan_now));
+        .route("/zones/scan",                   post(handlers::zones::run_scan_now))
+        .route("/trip-audit/matches",           get(handlers::trip_audit::list_matches))
+        .route("/trip-audit/matches/:id",       get(handlers::trip_audit::get_match))
+        .route("/trip-audit/matches/:id/review", post(handlers::trip_audit::review_match))
+        .route("/trip-audit/runs",              get(handlers::trip_audit::list_runs))
+        .route("/trip-audit/scan",              post(handlers::trip_audit::run_scan_now))
+        .route("/trip-audit/suggestions",       get(handlers::trip_audit::list_suggestions))
+        .route("/trip-audit/suggestions/:id/ack", post(handlers::trip_audit::ack_suggestion));
 
     // Admin — gated by token. If admin is disabled, the middleware short-
     // circuits with a 404 so the surface area is invisible.

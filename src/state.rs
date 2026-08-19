@@ -12,8 +12,10 @@ use crate::services::broadcaster::Broadcaster;
 use crate::services::history::HistoryService;
 use crate::services::live::LiveService;
 use crate::services::vehicles::VehiclesService;
+use crate::trips::osrm::OsrmClient;
+use crate::trips::pg::ApexDb;
 use crate::upstream::EtitClient;
-use crate::db::ZonesRepo;
+use crate::db::{TripAuditRepo, ZonesRepo};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,6 +27,10 @@ pub struct AppState {
     pub live: Arc<LiveService>,
     pub history: Arc<HistoryService>,
     pub zones_repo: ZonesRepo,
+    pub trip_repo: TripAuditRepo,
+    /// Read-only apex Postgres; None ⇒ trip audit disabled.
+    pub apex_db: Option<ApexDb>,
+    pub osrm: OsrmClient,
     pub broadcaster: Arc<Broadcaster>,
     pub started_at: Instant,
 }

@@ -176,3 +176,37 @@ Requires `X-Admin-Token` header.
   `upstream::users::UNBLOCK_TARGET`; update it if the grid's row order changes.
 
 
+
+## 5. Trip Audit (`/api/v1/trip-audit/*`)
+
+Populated by the nightly scanner (`TRIP_SCAN_TIME`). All endpoints require the
+standard admin JWT like the rest of `/api/v1`.
+
+### 5.1 `GET /trip-audit/matches?from=&to=&status=&company=&flagged=`
+One row per audited parent trip. `status` ∈ `matched|partial|unmatched`;
+`flagged=true` keeps only trips with at least one flag. Returns
+`flag_count`, totals (`actual_km`, `osrm_km`, `expected_km`,
+`distance_ratio`, `duration_ratio`), and review state.
+
+### 5.2 `GET /trip-audit/matches/:id`
+Match + `legs[]` (per-leg actual vs OSRM, `actual_geometry`/`osrm_geometry`
+polyline5, `max_deviation_m`, `night_window`) + `flags[]`
+(`excess_distance|excess_duration|unplanned_stop|route_deviation|`
+`skipped_delivery|no_return_data|no_terminal_departure`, `details_json`).
+
+### 5.3 `POST /trip-audit/matches/:id/review` — body `{ "note": "..."? }`
+Marks the trip reviewed (sets `reviewed_at`).
+
+### 5.4 `POST /trip-audit/scan` — body `{ "dates": ["YYYY-MM-DD"]? }`
+Runs a scan now (defaults to the lookback window). Returns the summary.
+
+### 5.5 `GET /trip-audit/runs`
+Last 30 scan runs with counters.
+
+### 5.6 `GET /trip-audit/suggestions?status=pending`
+GPS-derived pin suggestions (`kind` ∈ `terminal|dropoff`): suggested point,
+current pin (if any), `offset_m`, `stop_count`.
+
+### 5.7 `POST /trip-audit/suggestions/:id/ack` — body `{ "status": "accepted"|"dismissed" }`
+Records the inbox decision (the pin itself is written via the FalconGo
+locations API).
