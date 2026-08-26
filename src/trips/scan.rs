@@ -266,9 +266,20 @@ async fn do_run_scan(
                 }
             };
 
+            outcome.legs = split_legs_at_garages(
+                std::mem::take(&mut outcome.legs),
+                &stops,
+                &state.cfg.trip_allowed_points,
+                state.cfg.trip_allowed_point_dwell_secs,
+            );
+
             // ---- OSRM enrichment (only for legs we detected) ------------------
             let mut osrm_flags: Vec<(Flag, Option<usize>)> = Vec::new();
             for (leg_pos, leg) in outcome.legs.iter_mut().enumerate() {
+                if leg.leg_type == "garage" {
+                    // A dwell, not a drive: nothing to match or route.
+                    continue;
+                }
                 // Map-match the leg's raw trace onto the road network. When
                 // the match covers enough of the trace and lands in a sane
                 // band around the chord-sum, the matched road distance
@@ -445,20 +456,129 @@ async fn do_run_scan(
             }
 
             // ---- Trip totals ---------------------------------------------------
-            let legs_with_osrm = outcome.legs.iter().filter(|l| l.osrm_km.is_some()).count();
+            let travel_legs =
+                || outcome.legs.iter().filter(|l| l.leg_type != "garage");
+            let legs_with_osrm = travel_legs().filter(|l| l.osrm_km.is_some()).count();
             let actual_km: f64 = outcome.legs.iter().map(|l| l.actual_km).sum();
             let actual_secs: i64 =
                 outcome.legs.iter().map(|l| l.arrive_ts - l.depart_ts).sum();
-            let (osrm_km, osrm_secs) = if legs_with_osrm == outcome.legs.len()
-                && !outcome.legs.is_empty()
+            let (mut osrm_km, osrm_secs) = if legs_with_osrm == travel_legs().count()
+                && legs_with_osrm > 0
             {
                 (
-                    Some(outcome.legs.iter().filter_map(|l| l.osrm_km).sum::<f64>()),
-                    Some(outcome.legs.iter().filter_map(|l| l.osrm_secs).sum::<i64>()),
+                    Some(travel_legs().filter_map(|l| l.osrm_km).sum::<f64>()),
+                    Some(travel_legs().filter_map(|l| l.osrm_secs).sum::<i64>()),
                 )
             } else {
                 (None, None)
             };
+
+            // ---- Least-distance drop order --------------------------------------
+            // With several drop-offs, the honest optimal is the BEST visiting
+            // order, not the driven one. When a cheaper order exists, the
+            // trip-level optimal uses it and the driven order is flagged.
+            if osrm_km.is_some() {
+                let deliver_legs: Vec<(String, (f64, f64), f64, bool)> = outcome
+                    .legs
+                    .iter()
+                    .filter(|l| matches!(l.leg_type, "outbound" | "between"))
+                    .map(|l| (l.to_name.clone(), l.to_coords, l.osrm_km.unwrap_or(0.0), l.night_window))
+                    .filter(|(n, _, _, _)| n != "garage")
+                    .collect();
+                if deliver_legs.len() >= 2 && deliver_legs.len() <= 4 {
+                    let start = outcome
+                        .legs
+                        .iter()
+                        .find(|l| l.leg_type == "outbound")
+                        .map(|l| l.from_coords);
+                    if let Some(start) = start {
+                        let driven_km: f64 = deliver_legs.iter().map(|(_, _, k, _)| *k).sum();
+                        let night = deliver_legs[0].3;
+                        let nodes: Vec<(f64, f64)> = std::iter::once(start)
+                            .chain(deliver_legs.iter().map(|(_, c, _, _)| *c))
+                            .collect();
+                        let mut pair: HashMap<(usize, usize), f64> = HashMap::new();
+                        let mut all_ok = true;
+                        'pairs: for i in 0..nodes.len() {
+                            for j in 1..nodes.len() {
+                                if i == j {
+                                    continue;
+                                }
+                                match state.osrm.route(nodes[i], nodes[j], &[], !night).await {
+                                    Ok(r) => {
+                                        pair.insert((i, j), r.distance_km);
+                                    }
+                                    Err(_) => {
+                                        all_ok = false;
+                                        break 'pairs;
+                                    }
+                                }
+                            }
+                        }
+                        if all_ok {
+                            let n = deliver_legs.len();
+                            let mut idx: Vec<usize> = (1..=n).collect();
+                            let mut best_km = f64::MAX;
+                            let mut best_order: Vec<usize> = idx.clone();
+                            // Heap's algorithm over at most 4! = 24 orders.
+                            fn permute(
+                                k: usize,
+                                arr: &mut Vec<usize>,
+                                pair: &HashMap<(usize, usize), f64>,
+                                best_km: &mut f64,
+                                best_order: &mut Vec<usize>,
+                            ) {
+                                if k == 1 {
+                                    let mut total = 0.0;
+                                    let mut prev = 0usize;
+                                    for &x in arr.iter() {
+                                        total += pair.get(&(prev, x)).copied().unwrap_or(f64::MAX / 8.0);
+                                        prev = x;
+                                    }
+                                    if total < *best_km {
+                                        *best_km = total;
+                                        *best_order = arr.clone();
+                                    }
+                                    return;
+                                }
+                                for i in 0..k {
+                                    permute(k - 1, arr, pair, best_km, best_order);
+                                    if k % 2 == 0 {
+                                        arr.swap(i, k - 1);
+                                    } else {
+                                        arr.swap(0, k - 1);
+                                    }
+                                }
+                            }
+                            permute(n, &mut idx, &pair, &mut best_km, &mut best_order);
+
+                            if best_km + 0.5 < driven_km {
+                                let driven_names: Vec<&str> =
+                                    deliver_legs.iter().map(|(n, _, _, _)| n.as_str()).collect();
+                                let optimal_names: Vec<&str> = best_order
+                                    .iter()
+                                    .map(|&i| deliver_legs[i - 1].0.as_str())
+                                    .collect();
+                                osrm_km = osrm_km.map(|t| t - driven_km + best_km);
+                                osrm_flags.push((
+                                    Flag {
+                                        flag_type: "suboptimal_order",
+                                        severity: "warning",
+                                        details: serde_json::json!({
+                                            "driven_order": driven_names,
+                                            "optimal_order": optimal_names,
+                                            "driven_km": (driven_km * 10.0).round() / 10.0,
+                                            "optimal_km": (best_km * 10.0).round() / 10.0,
+                                            "savings_km": ((driven_km - best_km) * 10.0).round() / 10.0,
+                                        }),
+                                    },
+                                    None,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             let distance_ratio = match (osrm_km, actual_km) {
                 (Some(o), a) if o > 0.1 => Some(a / o),
                 _ => None,
@@ -618,6 +738,149 @@ async fn do_run_scan(
 
 /// Merge history for `day - 1 ..= day + 1` (clamped to today), pulling each
 /// day through the history service (memory → SQLite → upstream).
+/// Split travel legs at qualifying garage (allowed-point) dwells: the dwell
+/// becomes its own `leg_type = "garage"` leg, and the surrounding travel is
+/// re-scored per piece. The optimal then routes terminal→garage→drop-off by
+/// construction — no `via` bookkeeping — and the dashboard shows the garage
+/// stop as a first-class leg.
+fn split_legs_at_garages(
+    legs: Vec<crate::trips::MatchedLeg>,
+    stops: &[StopTS],
+    garages: &[(f64, f64, f64)],
+    min_dwell: i64,
+) -> Vec<crate::trips::MatchedLeg> {
+    use crate::trips::MatchedLeg;
+    if garages.is_empty() {
+        return legs;
+    }
+    let mut out: Vec<MatchedLeg> = Vec::with_capacity(legs.len());
+    for leg in legs {
+        let mut cuts: Vec<&StopTS> = stops
+            .iter()
+            .filter(|st| {
+                st.from > leg.depart_ts
+                    && st.to < leg.arrive_ts
+                    && st.to - st.from >= min_dwell
+                    && garages
+                        .iter()
+                        .any(|(la, ln, r)| haversine_m(st.lat, st.lng, *la, *ln) <= *r)
+            })
+            .collect();
+        cuts.sort_by_key(|st| st.from);
+        if cuts.is_empty() {
+            out.push(leg);
+            continue;
+        }
+        // GPS drift splits one long garage session into several stop
+        // records with minutes of "movement" between — merge dwells less
+        // than 15 minutes apart into one garage leg.
+        let mut merged: Vec<(i64, i64, f64, f64)> = Vec::new();
+        for st in cuts {
+            match merged.last_mut() {
+                Some(m) if st.from - m.1 <= 900 => m.1 = st.to,
+                _ => merged.push((st.from, st.to, st.lat, st.lng)),
+            }
+        }
+
+        let piece = |from_ts: i64,
+                     to_ts: i64,
+                     from_name: String,
+                     to_name: String,
+                     from_coords: (f64, f64),
+                     to_coords: (f64, f64),
+                     leg_type: &'static str,
+                     template: &MatchedLeg| {
+            let raw: Vec<(f64, f64, i64)> = template
+                .raw_points
+                .iter()
+                .filter(|(_, _, t)| *t >= from_ts && *t <= to_ts)
+                .copied()
+                .collect();
+            let pts: Vec<(f64, f64)> = raw.iter().map(|&(la, ln, _)| (la, ln)).collect();
+            MatchedLeg {
+                seq: 0, // resequenced below
+                leg_type,
+                from_name,
+                to_name,
+                from_coords,
+                to_coords,
+                depart_ts: from_ts,
+                arrive_ts: to_ts,
+                night_window: template.night_window,
+                actual_km: if leg_type == "garage" {
+                    0.0
+                } else {
+                    super::geo::track_length_km(&pts, 5_000.0)
+                },
+                osrm_km: None,
+                osrm_secs: None,
+                max_deviation_m: None,
+                actual_geometry: super::matcher::encode_track(&pts),
+                osrm_geometry: String::new(),
+                flag_idx: Vec::new(),
+                raw_points: raw,
+                distance_method: "chord",
+                off_route_pct: None,
+            }
+        };
+
+        let mut cursor_ts = leg.depart_ts;
+        let mut cursor_name = leg.from_name.clone();
+        let mut cursor_coords = leg.from_coords;
+        let first_flag_idx = leg.flag_idx.clone();
+        let mut first_piece = true;
+        for (g_from, g_to, g_lat, g_lng) in merged {
+            let gname = "garage".to_string();
+            let mut travel = piece(
+                cursor_ts,
+                g_from,
+                cursor_name.clone(),
+                gname.clone(),
+                cursor_coords,
+                (g_lat, g_lng),
+                leg.leg_type,
+                &leg,
+            );
+            if first_piece {
+                travel.flag_idx = first_flag_idx.clone();
+                first_piece = false;
+            }
+            out.push(travel);
+            out.push(piece(
+                g_from,
+                g_to,
+                gname.clone(),
+                gname,
+                (g_lat, g_lng),
+                (g_lat, g_lng),
+                "garage",
+                &leg,
+            ));
+            cursor_ts = g_to;
+            cursor_name = "garage".to_string();
+            cursor_coords = (g_lat, g_lng);
+        }
+        let mut tail = piece(
+            cursor_ts,
+            leg.arrive_ts,
+            cursor_name,
+            leg.to_name.clone(),
+            cursor_coords,
+            leg.to_coords,
+            leg.leg_type,
+            &leg,
+        );
+        if first_piece {
+            tail.flag_idx = first_flag_idx;
+        }
+        out.push(tail);
+    }
+    for (i, l) in out.iter_mut().enumerate() {
+        l.seq = i as i64;
+    }
+    out
+}
+
 async fn assemble_history(
     state: &AppState,
     vehicle_id: &str,
