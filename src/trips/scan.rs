@@ -219,9 +219,15 @@ async fn do_run_scan(
             let mut outcome = match assigned[tidx] {
                 Some(ji) => {
                     let j = &journeys[ji];
-                    let slice_start = j.start - 900;
-                    let slice_end =
-                        j.end.map_or(j.start + matcher_cfg.return_cap_secs, |e| e + 900);
+                    // Slice to the FULL terminal visits at both ends: the
+                    // matcher registers departure/return by visit dwell, and
+                    // parked trackers report sparsely — cutting at the exit/
+                    // entry starves visit detection (observed as a wall of
+                    // no_terminal_departure / missing returns).
+                    let slice_start = j.depart_entry - 300;
+                    let slice_end = j
+                        .end_exit
+                        .map_or(j.start + matcher_cfg.return_cap_secs, |e| e + 300);
                     let pts: Vec<_> = points
                         .iter()
                         .filter(|p| p.ts >= slice_start && p.ts <= slice_end)
@@ -238,7 +244,7 @@ async fn do_run_scan(
                         stops: &stp,
                         known_places: &known_places,
                         terminals: &terminals,
-                        not_before: j.start - 60,
+                        not_before: slice_start,
                     };
                     match_trip(&input, &matcher_cfg)
                 }

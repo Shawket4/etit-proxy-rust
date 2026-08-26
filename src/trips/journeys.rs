@@ -23,9 +23,16 @@ pub struct Journey {
     pub terminal_name: String,
     /// Terminal exit timestamp (journey start).
     pub start: i64,
+    /// Entry timestamp of the departing terminal visit — slicing from here
+    /// (not from the exit) keeps the full dwell visible to the matcher,
+    /// which needs it to register the departure visit at all.
+    pub depart_entry: i64,
     /// Next terminal entry (journey end). `None` = still open (no entry in
     /// the loaded GPS) — the matcher decides return_pending vs no_return.
     pub end: Option<i64>,
+    /// Exit timestamp of the closing terminal visit — the slice must reach
+    /// it so the return visit's dwell qualifies.
+    pub end_exit: Option<i64>,
     /// Names of drop-off geofences visited inside the journey, in order.
     pub dropoffs: Vec<String>,
 }
@@ -58,6 +65,7 @@ pub fn partition_journeys(
             continue;
         }
         let end = visits.get(i + 1).map(|(_, next)| next.entry);
+        let end_exit = visits.get(i + 1).map(|(_, next)| next.exit);
         match end {
             Some(e) => {
                 // Zero-travel gaps (GPS flapping at the fence) are not
@@ -96,7 +104,9 @@ pub fn partition_journeys(
         journeys.push(Journey {
             terminal_name: terminals[ti].name.clone(),
             start,
+            depart_entry: v.entry,
             end,
+            end_exit,
             dropoffs: visited.into_iter().map(|(_, n)| n).collect(),
         });
     }
