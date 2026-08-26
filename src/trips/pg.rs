@@ -1,13 +1,15 @@
 //! Read-only access to the apex Postgres DB (FalconGo's schema).
 //!
 //! The trip auditor needs: parent trips + their container trips, the car →
-//! ETIT-GUID mapping, terminal geofences (with aliases and radius
-//! overrides), drop-off pins, and contracted distances from fee_mappings.
+//! ETIT-GUID mapping, terminal geofences (picked by `terminal_id`, with
+//! radius overrides), drop-off pins, and contracted distances from
+//! fee_mappings.
 //!
-//! The canonical-locations tables (`drop_off_points`, `terminal_aliases`,
-//! `*.radius_m`) ship with the same release on the FalconGo side; every
-//! query that touches them has a legacy fallback so the scanner still works
-//! against a pre-migration database.
+//! The canonical-locations schema (`drop_off_points`, `*.terminal_id`,
+//! `*.radius_m`) ships with the same release on the FalconGo side; every
+//! query that touches it has a legacy fallback so the scanner still works
+//! against a pre-migration database (terminal resolution then falls back
+//! to exact-name matching).
 
 use std::collections::HashMap;
 
@@ -25,10 +27,10 @@ pub struct ApexDb {
 /// Everything location-shaped the matcher and calibrator need, loaded once
 /// per scan.
 pub struct LocationCatalog {
-    /// Canonical terminal name → Place.
+    /// Canonical terminal name → Place (pinned terminals only).
     pub terminals: HashMap<String, Place>,
-    /// Alias (or canonical name) → canonical terminal name.
-    pub terminal_lookup: HashMap<String, String>,
+    /// Terminal id → canonical name (pinned terminals only).
+    pub terminal_names_by_id: HashMap<i64, String>,
     /// Drop-off name → Place (only pinned ones).
     pub dropoffs: HashMap<String, Place>,
     /// Drop-off names that exist but have no pin (for unmatched reasons).
@@ -36,9 +38,15 @@ pub struct LocationCatalog {
 }
 
 impl LocationCatalog {
-    pub fn resolve_terminal(&self, raw: &str) -> Option<&Place> {
-        let name = self.terminal_lookup.get(raw.trim())?;
-        self.terminals.get(name)
+    /// Resolve by FK first (the canonical path post-migration); fall back to
+    /// exact name for rows the backfill hasn't touched.
+    pub fn resolve_terminal(&self, terminal_id: Option<i64>, raw_name: &str) -> Option<&Place> {
+        if let Some(id) = terminal_id {
+            if let Some(name) = self.terminal_names_by_id.get(&id) {
+                return self.terminals.get(name);
+            }
+        }
+        self.terminals.get(raw_name.trim())
     }
 
     /// All known geofences: used to exempt planned stops from the
@@ -70,9 +78,10 @@ impl ApexDb {
         default_dropoff_radius: f64,
     ) -> Result<LocationCatalog> {
         // Terminals — radius_m may not exist pre-migration.
-        let term_rows: Vec<(String, Option<f64>, Option<f64>, Option<f64>)> =
+        let term_rows: Vec<(i64, String, Option<f64>, Option<f64>, Option<f64>)> =
             match sqlx::query_as(
-                r#"SELECT name, CAST(latitude AS float8), CAST(longitude AS float8),
+                r#"SELECT CAST(id AS int8), name,
+                          CAST(latitude AS float8), CAST(longitude AS float8),
                           CAST(radius_m AS float8)
                      FROM terminals WHERE deleted_at IS NULL"#,
             )
@@ -82,24 +91,25 @@ impl ApexDb {
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::warn!(error = %e, "terminals.radius_m not available; using legacy query");
-                    let legacy: Vec<(String, Option<f64>, Option<f64>)> = sqlx::query_as(
-                        r#"SELECT name, CAST(latitude AS float8), CAST(longitude AS float8)
+                    let legacy: Vec<(i64, String, Option<f64>, Option<f64>)> = sqlx::query_as(
+                        r#"SELECT CAST(id AS int8), name,
+                                  CAST(latitude AS float8), CAST(longitude AS float8)
                              FROM terminals WHERE deleted_at IS NULL"#,
                     )
                     .fetch_all(&self.pool)
                     .await
                     .context("loading terminals")?;
-                    legacy.into_iter().map(|(n, la, ln)| (n, la, ln, None)).collect()
+                    legacy.into_iter().map(|(i, n, la, ln)| (i, n, la, ln, None)).collect()
                 }
             };
 
         let mut terminals = HashMap::new();
-        let mut terminal_lookup = HashMap::new();
-        for (name, lat, lng, radius) in term_rows {
+        let mut terminal_names_by_id = HashMap::new();
+        for (id, name, lat, lng, radius) in term_rows {
             let name = name.trim().to_string();
             if let (Some(lat), Some(lng)) = (lat, lng) {
                 if lat != 0.0 || lng != 0.0 {
-                    terminal_lookup.insert(name.clone(), name.clone());
+                    terminal_names_by_id.insert(id, name.clone());
                     terminals.insert(
                         name.clone(),
                         Place {
@@ -111,23 +121,6 @@ impl ApexDb {
                     );
                 }
             }
-        }
-
-        // Aliases — table may not exist pre-migration.
-        let alias_rows: Vec<(String, String)> = sqlx::query_as(
-            r#"SELECT a.alias, t.name
-                 FROM terminal_aliases a
-                 JOIN terminals t ON t.id = a.terminal_id
-                WHERE a.deleted_at IS NULL AND t.deleted_at IS NULL"#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "terminal_aliases not available; continuing without");
-            Vec::new()
-        });
-        for (alias, name) in alias_rows {
-            terminal_lookup.insert(alias.trim().to_string(), name.trim().to_string());
         }
 
         // Drop-off pins — prefer canonical drop_off_points, fall back to the
@@ -194,7 +187,7 @@ impl ApexDb {
 
         Ok(LocationCatalog {
             terminals,
-            terminal_lookup,
+            terminal_names_by_id,
             dropoffs,
             unpinned_dropoffs: unpinned,
         })
@@ -236,19 +229,41 @@ impl ApexDb {
         dates: &[String],
         catalog: &LocationCatalog,
     ) -> Result<Vec<PlannedTrip>> {
-        let parents: Vec<(i64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> =
-            sqlx::query_as(
-                r#"SELECT CAST(pt.id AS int8), pt.date, pt.company, pt.terminal,
-                          pt.car_no_plate, pt.driver_name, c.etit_car_id
-                     FROM parent_trips pt
-                     LEFT JOIN cars c ON c.id = pt.car_id
-                    WHERE pt.deleted_at IS NULL AND pt.date = ANY($1)
-                    ORDER BY pt.date, pt.id"#,
-            )
-            .bind(dates)
-            .fetch_all(&self.pool)
-            .await
-            .context("loading parent_trips")?;
+        type ParentRow = (i64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<i64>);
+        let parents: Vec<ParentRow> = match sqlx::query_as(
+            r#"SELECT CAST(pt.id AS int8), pt.date, pt.company, pt.terminal,
+                      pt.car_no_plate, pt.driver_name, c.etit_car_id,
+                      CAST(pt.terminal_id AS int8)
+                 FROM parent_trips pt
+                 LEFT JOIN cars c ON c.id = pt.car_id
+                WHERE pt.deleted_at IS NULL AND pt.date = ANY($1)
+                ORDER BY pt.date, pt.id"#,
+        )
+        .bind(dates)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "parent_trips.terminal_id not available; using legacy query");
+                let legacy: Vec<(i64, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                    r#"SELECT CAST(pt.id AS int8), pt.date, pt.company, pt.terminal,
+                              pt.car_no_plate, pt.driver_name, c.etit_car_id
+                         FROM parent_trips pt
+                         LEFT JOIN cars c ON c.id = pt.car_id
+                        WHERE pt.deleted_at IS NULL AND pt.date = ANY($1)
+                        ORDER BY pt.date, pt.id"#,
+                )
+                .bind(dates)
+                .fetch_all(&self.pool)
+                .await
+                .context("loading parent_trips")?;
+                legacy
+                    .into_iter()
+                    .map(|(a, b, c, d, e, f, g)| (a, b, c, d, e, f, g, None))
+                    .collect()
+            }
+        };
 
         if parents.is_empty() {
             return Ok(Vec::new());
@@ -292,13 +307,13 @@ impl ApexDb {
 
         Ok(parents
             .into_iter()
-            .map(|(id, date, company, terminal, plate, driver, guid)| {
+            .map(|(id, date, company, terminal, plate, driver, guid, terminal_id)| {
                 let terminal_name = terminal.unwrap_or_default().trim().to_string();
                 PlannedTrip {
                     parent_trip_id: id,
                     day_local: date,
                     company: company.unwrap_or_default(),
-                    terminal: catalog.resolve_terminal(&terminal_name).cloned(),
+                    terminal: catalog.resolve_terminal(terminal_id, &terminal_name).cloned(),
                     terminal_name,
                     car_no_plate: plate.unwrap_or_default(),
                     driver_name: driver.unwrap_or_default(),
