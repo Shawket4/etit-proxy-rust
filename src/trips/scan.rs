@@ -164,9 +164,22 @@ async fn do_run_scan(
         let mut day_cache: HashMap<NaiveDate, (Vec<PointTS>, Vec<StopTS>)> = HashMap::new();
         let mut last_end_ts: Option<i64> = None;
 
-        for trip in &trips {
-            let Ok(day) = NaiveDate::parse_from_str(&trip.day_local, "%Y-%m-%d") else {
-                tracing::warn!(parent_trip_id = trip.parent_trip_id, day = %trip.day_local, "unparseable trip date");
+        // Group the vehicle's trips by day: the day's GPS is partitioned into
+        // physical journeys ONCE, and each registered trip is assigned at
+        // most one journey whose details agree (same terminal, its drop-offs
+        // visited). Matching then runs strictly inside the assigned window —
+        // several same-terminal trips per day no longer collide.
+        let mut day_groups: Vec<(String, Vec<PlannedTrip>)> = Vec::new();
+        for trip in trips {
+            match day_groups.last_mut() {
+                Some((d, group)) if *d == trip.day_local => group.push(trip),
+                _ => day_groups.push((trip.day_local.clone(), vec![trip])),
+            }
+        }
+
+        for (day_str, day_trips) in &day_groups {
+            let Ok(day) = NaiveDate::parse_from_str(day_str, "%Y-%m-%d") else {
+                tracing::warn!(day = %day_str, "unparseable trip date");
                 continue;
             };
 
@@ -176,19 +189,82 @@ async fn do_run_scan(
                 (Vec::new(), Vec::new())
             };
 
-            let window_start = crate::domain::time::start_of_day_utc(day, tz).timestamp()
+            let day_start = crate::domain::time::start_of_day_utc(day, tz).timestamp()
                 - TRIP_WINDOW_HEAD_START_SECS;
-            let not_before = last_end_ts.map_or(window_start, |t| t.max(window_start));
+            let window_start = last_end_ts.map_or(day_start, |t| t.max(day_start));
+            let window_end = day_start + TRIP_WINDOW_HEAD_START_SECS + 86_400;
 
-            let input = MatchInput {
-                planned: trip,
-                points: &points,
-                stops: &stops,
-                known_places: &known_places,
-                terminals: &terminals,
-                not_before,
+            let mut day_dropoffs: Vec<super::Place> = Vec::new();
+            for t in day_trips {
+                for d in &t.deliveries {
+                    if let Some(p) = &d.place {
+                        if !day_dropoffs.iter().any(|x| x.name == p.name) {
+                            day_dropoffs.push(p.clone());
+                        }
+                    }
+                }
+            }
+
+            let journeys = super::journeys::partition_journeys(
+                &points,
+                &terminals,
+                &day_dropoffs,
+                window_start,
+                window_end,
+            );
+            let trip_refs: Vec<&PlannedTrip> = day_trips.iter().collect();
+            let assigned = super::journeys::assign_journeys(&journeys, &trip_refs);
+
+            for (tidx, trip) in day_trips.iter().enumerate() {
+            let mut outcome = match assigned[tidx] {
+                Some(ji) => {
+                    let j = &journeys[ji];
+                    let slice_start = j.start - 900;
+                    let slice_end =
+                        j.end.map_or(j.start + matcher_cfg.return_cap_secs, |e| e + 900);
+                    let pts: Vec<_> = points
+                        .iter()
+                        .filter(|p| p.ts >= slice_start && p.ts <= slice_end)
+                        .cloned()
+                        .collect();
+                    let stp: Vec<_> = stops
+                        .iter()
+                        .filter(|s| s.from >= slice_start && s.from <= slice_end)
+                        .cloned()
+                        .collect();
+                    let input = MatchInput {
+                        planned: trip,
+                        points: &pts,
+                        stops: &stp,
+                        known_places: &known_places,
+                        terminals: &terminals,
+                        not_before: j.start - 60,
+                    };
+                    match_trip(&input, &matcher_cfg)
+                }
+                None => {
+                    // Precondition failures keep their canonical reasons via
+                    // an empty-window match; otherwise the day simply had no
+                    // journey with this trip's details.
+                    let preconditions_fail = trip.etit_car_id.is_empty()
+                        || trip.terminal.is_none()
+                        || trip.deliveries.iter().all(|d| d.place.is_none())
+                        || points.is_empty();
+                    let input = MatchInput {
+                        planned: trip,
+                        points: &[],
+                        stops: &[],
+                        known_places: &known_places,
+                        terminals: &terminals,
+                        not_before: 0,
+                    };
+                    let mut o = match_trip(&input, &matcher_cfg);
+                    if !preconditions_fail {
+                        o.unmatched_reason = Some("no_matching_journey");
+                    }
+                    o
+                }
             };
-            let mut outcome = match_trip(&input, &matcher_cfg);
 
             // ---- OSRM enrichment (only for legs we detected) ------------------
             let mut osrm_flags: Vec<(Flag, Option<usize>)> = Vec::new();
@@ -510,6 +586,12 @@ async fn do_run_scan(
 
             if let Some(end) = outcome.end_ts {
                 last_end_ts = Some(end);
+            }
+            if let Some(ji) = assigned[tidx] {
+                if let Some(je) = journeys[ji].end {
+                    last_end_ts = Some(last_end_ts.map_or(je, |t| t.max(je)));
+                }
+            }
             }
         }
     }

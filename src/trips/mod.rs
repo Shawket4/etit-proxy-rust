@@ -14,6 +14,7 @@
 
 pub mod calibrate;
 pub mod geo;
+pub mod journeys;
 pub mod matcher;
 pub mod osrm;
 pub mod pg;

@@ -407,7 +407,7 @@ fn in_night_window(ts: i64, cfg: &MatcherConfig) -> bool {
 
 /// Visit detection against an arbitrary place (same algorithm as the
 /// dead-zone scanner), ignoring points before `not_before`.
-fn detect_visits(points: &[PointTS], place: &Place, not_before: i64) -> Vec<Visit> {
+pub(crate) fn detect_visits(points: &[PointTS], place: &Place, not_before: i64) -> Vec<Visit> {
     let (dlat, dlng) = bbox_deltas(place.lat, place.radius_m);
     let mut visits = Vec::new();
     let (mut in_visit, mut start, mut last_inside, mut count) = (false, 0i64, 0i64, 0u32);
