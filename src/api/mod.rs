@@ -38,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/zones/:id",                    get(handlers::zones::get_one).put(handlers::zones::update).delete(handlers::zones::delete))
         .route("/zones/scan",                   post(handlers::zones::run_scan_now))
         .route("/trip-audit/matches",           get(handlers::trip_audit::list_matches))
+        .route("/trip-audit/summary",           get(handlers::trip_audit::summary))
         .route("/trip-audit/matches/:id",       get(handlers::trip_audit::get_match))
         .route("/trip-audit/matches/:id/review", post(handlers::trip_audit::review_match))
         .route("/trip-audit/runs",              get(handlers::trip_audit::list_runs))

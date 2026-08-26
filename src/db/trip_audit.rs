@@ -17,6 +17,30 @@ pub struct TripAuditRepo {
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct MatchSummaryRow {
+    pub total: i64,
+    pub matched: i64,
+    pub partial: i64,
+    pub unmatched: i64,
+    pub flagged: i64,
+    pub critical: i64,
+    pub flagged_unreviewed: i64,
+    pub actual_km: f64,
+    /// Actual km restricted to trips that have an OSRM comparison — the
+    /// honest denominator-mate for `osrm_km` when computing efficiency.
+    pub actual_km_compared: f64,
+    pub osrm_km: f64,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct WorstRouteRow {
+    pub terminal_name: String,
+    pub destinations: Option<String>,
+    pub trips: i64,
+    pub excess_km: f64,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TripMatchRow {
     pub id: i64,
     pub scan_run_id: i64,
@@ -478,6 +502,87 @@ impl TripAuditRepo {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Whole-window aggregates for the KPI strip — computed in SQL so they
+    /// are exact regardless of pagination.
+    pub async fn match_summary(
+        &self,
+        from_day: Option<&str>,
+        to_day: Option<&str>,
+        company: Option<&str>,
+    ) -> Result<MatchSummaryRow> {
+        let mut filter = String::from(" FROM trip_matches m WHERE 1=1");
+        if from_day.is_some() {
+            filter.push_str(" AND m.day_local >= ?");
+        }
+        if to_day.is_some() {
+            filter.push_str(" AND m.day_local <= ?");
+        }
+        if company.is_some() {
+            filter.push_str(" AND m.company = ?");
+        }
+        let sql = format!(
+            r#"SELECT
+                 COUNT(*)                                             AS total,
+                 SUM(m.status = 'matched')                            AS matched,
+                 SUM(m.status = 'partial')                            AS partial,
+                 SUM(m.status = 'unmatched')                          AS unmatched,
+                 SUM(EXISTS (SELECT 1 FROM trip_flags f WHERE f.match_id = m.id))          AS flagged,
+                 SUM(EXISTS (SELECT 1 FROM trip_flags f WHERE f.match_id = m.id
+                              AND f.severity = 'critical'))           AS critical,
+                 SUM(m.reviewed_at IS NULL AND EXISTS (
+                       SELECT 1 FROM trip_flags f WHERE f.match_id = m.id))                AS flagged_unreviewed,
+                 COALESCE(SUM(m.actual_km), 0.0)                      AS actual_km,
+                 COALESCE(SUM(CASE WHEN m.osrm_km IS NOT NULL THEN m.actual_km END), 0.0) AS actual_km_compared,
+                 COALESCE(SUM(m.osrm_km), 0.0)                        AS osrm_km
+               {filter}"#
+        );
+        let mut q = sqlx::query_as::<_, MatchSummaryRow>(&sql);
+        for v in [from_day, to_day, company].into_iter().flatten() {
+            q = q.bind(v.to_string());
+        }
+        Ok(q.fetch_one(&self.pool).await?)
+    }
+
+    /// Top excess-km routes in the window (for the "worst route" KPI).
+    pub async fn worst_routes(
+        &self,
+        from_day: Option<&str>,
+        to_day: Option<&str>,
+        company: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<WorstRouteRow>> {
+        let mut filter = String::from(
+            " FROM trip_matches m WHERE m.osrm_km IS NOT NULL AND m.actual_km IS NOT NULL",
+        );
+        if from_day.is_some() {
+            filter.push_str(" AND m.day_local >= ?");
+        }
+        if to_day.is_some() {
+            filter.push_str(" AND m.day_local <= ?");
+        }
+        if company.is_some() {
+            filter.push_str(" AND m.company = ?");
+        }
+        let sql = format!(
+            r#"SELECT m.terminal_name,
+                      (SELECT GROUP_CONCAT(DISTINCT l.to_name)
+                         FROM trip_match_legs l
+                        WHERE l.match_id = m.id AND l.leg_type != 'return') AS destinations,
+                      COUNT(*)                                     AS trips,
+                      COALESCE(SUM(m.actual_km - m.osrm_km), 0.0)  AS excess_km
+                 {filter}
+                GROUP BY m.terminal_name, destinations
+               HAVING excess_km > 0
+                ORDER BY excess_km DESC
+                LIMIT ?"#
+        );
+        let mut q = sqlx::query_as::<_, WorstRouteRow>(&sql);
+        for v in [from_day, to_day, company].into_iter().flatten() {
+            q = q.bind(v.to_string());
+        }
+        Ok(q.bind(limit.clamp(1, 20)).fetch_all(&self.pool).await?)
     }
 
     pub async fn mark_suggestion_auto_applied(&self, kind: &str, name: &str) -> Result<()> {

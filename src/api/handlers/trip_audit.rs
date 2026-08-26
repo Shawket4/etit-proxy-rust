@@ -61,6 +61,47 @@ pub async fn list_matches(
     Ok(Json(PageEnvelope { items, total, page, per_page }))
 }
 
+#[derive(Deserialize)]
+pub struct SummaryQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub company: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SummaryResponse {
+    #[serde(flatten)]
+    pub totals: crate::db::trip_audit::MatchSummaryRow,
+    /// sum(osrm) / sum(actual) over compared trips, percent. None until at
+    /// least one trip has an OSRM comparison.
+    pub efficiency_pct: Option<f64>,
+    pub excess_km: f64,
+    pub worst_routes: Vec<crate::db::trip_audit::WorstRouteRow>,
+}
+
+/// Whole-window KPI aggregates — exact regardless of pagination.
+pub async fn summary(
+    State(s): State<AppState>,
+    Query(q): Query<SummaryQuery>,
+) -> AppResult<Json<SummaryResponse>> {
+    let totals = s
+        .trip_repo
+        .match_summary(q.from.as_deref(), q.to.as_deref(), q.company.as_deref())
+        .await?;
+    let worst_routes = s
+        .trip_repo
+        .worst_routes(q.from.as_deref(), q.to.as_deref(), q.company.as_deref(), 3)
+        .await?;
+    let efficiency_pct = if totals.actual_km_compared > 0.0 {
+        Some((totals.osrm_km / totals.actual_km_compared * 1000.0).round() / 10.0)
+    } else {
+        None
+    };
+    let excess_km =
+        ((totals.actual_km_compared - totals.osrm_km).max(0.0) * 10.0).round() / 10.0;
+    Ok(Json(SummaryResponse { totals, efficiency_pct, excess_km, worst_routes }))
+}
+
 #[derive(Serialize)]
 pub struct MatchDetail {
     #[serde(flatten)]
