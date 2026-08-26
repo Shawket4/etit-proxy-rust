@@ -10,7 +10,7 @@
 //! most one journey — only where the details agree: the journey departs the
 //! trip's terminal, preferring the journey that visits the trip's drop-offs.
 
-use super::matcher::detect_visits;
+use super::matcher::owned_visits;
 use crate::zones::PointTS;
 use super::{Place, PlannedTrip};
 use crate::zones::Visit;
@@ -48,14 +48,21 @@ pub fn partition_journeys(
     window_start: i64,
     window_end: i64,
 ) -> Vec<Journey> {
-    // All terminal visits, tagged and chronological.
+    // All terminal visits, tagged and chronological. Terminals and drop-offs
+    // compete for points in one arena, so overlapping fences (two pins across
+    // the street) can't both claim the same dwell.
+    let mut arena: Vec<Place> = terminals.to_vec();
+    arena.extend(dropoffs.iter().cloned());
+    let owned = owned_visits(points, &arena, 0);
+
     let mut visits: Vec<(usize, Visit)> = Vec::new();
-    for (ti, t) in terminals.iter().enumerate() {
-        for v in detect_visits(points, t, 0) {
-            visits.push((ti, v));
+    for (ti, vs) in owned.iter().take(terminals.len()).enumerate() {
+        for v in vs {
+            visits.push((ti, v.clone()));
         }
     }
     visits.sort_by_key(|(_, v)| v.entry);
+    let dropoff_visits = &owned[terminals.len()..];
 
     let mut journeys = Vec::new();
     for i in 0..visits.len() {
@@ -92,8 +99,8 @@ pub fn partition_journeys(
         }
         let d_end = end.unwrap_or(i64::MAX);
         let mut visited: Vec<(i64, String)> = Vec::new();
-        for d in dropoffs {
-            for dv in detect_visits(points, d, start) {
+        for (di, d) in dropoffs.iter().enumerate() {
+            for dv in &dropoff_visits[di] {
                 if dv.entry >= start && dv.entry < d_end {
                     visited.push((dv.entry, d.name.clone()));
                     break;
@@ -252,6 +259,27 @@ mod tests {
         let t = trip(&term_b, "A", None); // registered from the OTHER terminal
         let trips: Vec<&PlannedTrip> = vec![&t];
         assert_eq!(assign_journeys(&journeys, &trips), vec![None]);
+    }
+
+    #[test]
+    fn overlapping_fences_do_not_create_phantom_journeys() {
+        // Drop-off X sits 350 m from the terminal — inside the terminal's
+        // 400 m fence. A dwell at X used to register as a terminal visit
+        // too, splitting the day into phantom journeys.
+        let term = place("بدر", 30.1000, 31.7000);
+        let x = place("X", 30.1000 + 350.0 / 111_320.0, 31.7000);
+
+        let points = pts(&[
+            ((30.1000, 31.7000), 1_000, 4_000),                    // load at terminal
+            ((30.1000 + 350.0 / 111_320.0, 31.7000), 8_000, 11_000), // deliver at X
+            ((30.1000, 31.7000), 15_000, 18_000),                  // back at terminal
+        ]);
+
+        let journeys =
+            partition_journeys(&points, &[term.clone()], &[x.clone()], 0, i64::MAX);
+        assert_eq!(journeys.len(), 1, "phantom journeys: {journeys:?}");
+        assert_eq!(journeys[0].dropoffs, vec!["X".to_string()]);
+        assert!(journeys[0].end.is_some());
     }
 
     #[test]

@@ -110,15 +110,35 @@ pub fn match_trip(input: &MatchInput, cfg: &MatcherConfig) -> MatchOutcome {
     }
 
     // ---- Detect visit intervals per geofence --------------------------------
-    let terminal_visits = detect_visits(input.points, terminal, input.not_before);
+    // The arena is every known place, so overlapping fences compete for
+    // points and one dwell can never register at two places.
+    let mut arena: Vec<Place> = vec![terminal.clone()];
+    let mut delivery_arena_idx: Vec<(usize, usize)> = Vec::new(); // (delivery idx, arena idx)
+    for (idx, d) in planned.deliveries.iter().enumerate() {
+        if let Some(place) = &d.place {
+            delivery_arena_idx.push((idx, arena.len()));
+            arena.push(place.clone());
+        }
+    }
+    let base_len = arena.len();
+    for kp in input.known_places {
+        if !arena
+            .iter()
+            .any(|a| a.name == kp.name || haversine_m(a.lat, a.lng, kp.lat, kp.lng) < 1.0)
+        {
+            arena.push(kp.clone());
+        }
+    }
+    let mut owned = owned_visits(input.points, &arena, input.not_before);
+    owned.truncate(base_len);
+    let mut owned_iter = owned.into_iter();
+    let terminal_visits = owned_iter.next().unwrap_or_default();
+    let owned_rest: Vec<Vec<Visit>> = owned_iter.collect();
 
     // (delivery index, visits)
     let mut delivery_visits: Vec<(usize, Vec<Visit>)> = Vec::new();
-    for (idx, d) in planned.deliveries.iter().enumerate() {
-        if let Some(place) = &d.place {
-            let visits = detect_visits(input.points, place, input.not_before);
-            delivery_visits.push((idx, visits));
-        }
+    for (pos, (idx, _)) in delivery_arena_idx.iter().enumerate() {
+        delivery_visits.push((*idx, owned_rest.get(pos).cloned().unwrap_or_default()));
     }
 
     let first_arrival = delivery_visits
@@ -403,6 +423,80 @@ fn in_night_window(ts: i64, cfg: &MatcherConfig) -> bool {
     } else {
         local >= cfg.night_start || local < cfg.night_end
     }
+}
+
+/// Exclusive-ownership visit detection: when geofences overlap (two pins
+/// across the street), each point counts for AT MOST one place — the one
+/// whose fence it sits deepest inside (min distance/radius, so differing
+/// radii compare fairly). Prevents one physical dwell from looking like
+/// visits to two places (phantom "left, dwelled again, returned").
+/// Returns one visit list per place, index-aligned with `places`.
+pub(crate) fn owned_visits(
+    points: &[PointTS],
+    places: &[Place],
+    not_before: i64,
+) -> Vec<Vec<Visit>> {
+    let deltas: Vec<(f64, f64)> =
+        places.iter().map(|p| bbox_deltas(p.lat, p.radius_m)).collect();
+
+    // Per-place open-visit state.
+    struct St {
+        in_visit: bool,
+        start: i64,
+        last_inside: i64,
+        count: u32,
+    }
+    let mut st: Vec<St> = places
+        .iter()
+        .map(|_| St { in_visit: false, start: 0, last_inside: 0, count: 0 })
+        .collect();
+    let mut out: Vec<Vec<Visit>> = places.iter().map(|_| Vec::new()).collect();
+
+    for p in points {
+        if p.ts < not_before {
+            continue;
+        }
+        // Owner: deepest containing fence, if any.
+        let mut owner: Option<(usize, f64)> = None;
+        for (i, place) in places.iter().enumerate() {
+            let (dlat, dlng) = deltas[i];
+            if (p.lat - place.lat).abs() > dlat || (p.lng - place.lng).abs() > dlng {
+                continue;
+            }
+            let d = haversine_m(p.lat, p.lng, place.lat, place.lng);
+            if d > place.radius_m {
+                continue;
+            }
+            let depth = d / place.radius_m.max(1.0);
+            if owner.map_or(true, |(_, best)| depth < best) {
+                owner = Some((i, depth));
+            }
+        }
+
+        for (i, s) in st.iter_mut().enumerate() {
+            if owner.map(|(o, _)| o) == Some(i) {
+                if !s.in_visit {
+                    s.in_visit = true;
+                    s.start = p.ts;
+                    s.count = 0;
+                }
+                s.last_inside = p.ts;
+                s.count += 1;
+            } else if s.in_visit && (p.ts - s.last_inside) > VISIT_GAP_SECS {
+                out[i].push(Visit { entry: s.start, exit: s.last_inside, points: s.count });
+                s.in_visit = false;
+            }
+        }
+    }
+    for (i, s) in st.iter().enumerate() {
+        if s.in_visit {
+            out[i].push(Visit { entry: s.start, exit: s.last_inside, points: s.count });
+        }
+    }
+    for v in &mut out {
+        v.retain(|x| x.exit - x.entry >= MIN_VISIT_DWELL_SECS);
+    }
+    out
 }
 
 /// Visit detection against an arbitrary place (same algorithm as the
