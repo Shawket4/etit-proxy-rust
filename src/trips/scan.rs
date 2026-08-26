@@ -551,17 +551,18 @@ async fn run_calibration(
         }
     }
 
-    // ---- Unpinned drop-offs: suggest a pin from serving trucks' stops ---------
-    if !catalog.unpinned_dropoffs.is_empty() {
-        if let Some(apex) = state.apex_db.as_ref() {
-            let service_days = apex
-                .load_dropoff_service_days(&since, &catalog.unpinned_dropoffs)
-                .await
-                .unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "loading drop-off service days failed");
-                    Vec::new()
-                });
+    // ---- Unpinned places: suggest a pin from serving trucks' stops ------------
+    // Drop-offs come from the trips that delivered to them; terminals from
+    // the parent trips that departed them. Confident suggestions for a place
+    // with NO pin are auto-applied (pin_source = 'gps_suggested') — an empty
+    // pin blocks auditing, and the write is guarded to never move a pin a
+    // human has set. Corrections to existing pins always stay human-reviewed.
+    if let Some(apex) = state.apex_db.as_ref() {
+        let mut unpinned: Vec<(&'static str, String, Vec<(f64, f64)>)> = Vec::new();
 
+        let mut collect = |kind: &'static str,
+                           service_days: Vec<(String, String, String)>,
+                           out: &mut Vec<(&'static str, String, Vec<(f64, f64)>)>| {
             let mut by_name: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
             for (name, day, vehicle) in service_days {
                 if let Some(stops) = per_vehicle_day.get(&(vehicle, day)) {
@@ -576,10 +577,47 @@ async fn run_calibration(
                 }
             }
             for (name, stops) in by_name {
-                if let Some(s) = calibrate::suggest_for_unpinned(&name, &stops) {
-                    state.trip_repo.upsert_suggestion(&s, run_id).await?;
-                    made += 1;
+                out.push((kind, name, stops));
+            }
+        };
+
+        if !catalog.unpinned_dropoffs.is_empty() {
+            let days = apex
+                .load_dropoff_service_days(&since, &catalog.unpinned_dropoffs)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "loading drop-off service days failed");
+                    Vec::new()
+                });
+            collect("dropoff", days, &mut unpinned);
+        }
+        if !catalog.unpinned_terminals.is_empty() {
+            let days = apex
+                .load_terminal_service_days(&since, &catalog.unpinned_terminals)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "loading terminal service days failed");
+                    Vec::new()
+                });
+            collect("terminal", days, &mut unpinned);
+        }
+
+        for (kind, name, stops) in unpinned {
+            if let Some(s) = calibrate::suggest_for_unpinned(kind, &name, &stops) {
+                let auto_applied = s.stop_count >= state.cfg.trip_pin_auto_apply_min_stops
+                    && apex
+                        .apply_pin_if_unpinned(kind, &name, s.suggested_lat, s.suggested_lng)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, kind, name = %name, "auto-apply pin failed");
+                            false
+                        });
+                state.trip_repo.upsert_suggestion(&s, run_id).await?;
+                if auto_applied {
+                    tracing::info!(kind, name = %name, stops = s.stop_count, "auto-applied GPS pin");
+                    state.trip_repo.mark_suggestion_auto_applied(kind, &name).await?;
                 }
+                made += 1;
             }
         }
     }

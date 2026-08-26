@@ -102,15 +102,19 @@ pub fn suggest_for_pinned(
     })
 }
 
-/// Suggest a pin for an unpinned drop-off from candidate stops (long stops
+/// Suggest a pin for an unpinned place from candidate stops (long stops
 /// during trips that served it, away from every known geofence).
-pub fn suggest_for_unpinned(name: &str, stops: &[(f64, f64)]) -> Option<Suggestion> {
+pub fn suggest_for_unpinned(
+    kind: &'static str,
+    name: &str,
+    stops: &[(f64, f64)],
+) -> Option<Suggestion> {
     let ((clat, clng), n) = densest_cluster(stops)?;
     if n < MIN_STOPS_UNPINNED {
         return None;
     }
     Some(Suggestion {
-        kind: "dropoff",
+        kind,
         name: name.to_string(),
         suggested_lat: clat,
         suggested_lng: clng,
@@ -159,9 +163,9 @@ mod tests {
     #[test]
     fn unpinned_needs_minimum_support() {
         let stops = vec![(30.1, 31.2), (30.1001, 31.2001), (30.1002, 31.2)];
-        assert!(suggest_for_unpinned("new station", &stops).is_none());
+        assert!(suggest_for_unpinned("dropoff", "new station", &stops).is_none());
         let stops: Vec<(f64, f64)> =
             (0..6).map(|i| (30.1 + (i % 3) as f64 * 1e-4, 31.2)).collect();
-        assert!(suggest_for_unpinned("new station", &stops).is_some());
+        assert!(suggest_for_unpinned("dropoff", "new station", &stops).is_some());
     }
 }

@@ -35,6 +35,8 @@ pub struct LocationCatalog {
     pub dropoffs: HashMap<String, Place>,
     /// Drop-off names that exist but have no pin (for unmatched reasons).
     pub unpinned_dropoffs: Vec<String>,
+    /// Terminal names that exist but have no pin (calibration targets).
+    pub unpinned_terminals: Vec<String>,
 }
 
 impl LocationCatalog {
@@ -105,10 +107,11 @@ impl ApexDb {
 
         let mut terminals = HashMap::new();
         let mut terminal_names_by_id = HashMap::new();
+        let mut unpinned_terminals = Vec::new();
         for (id, name, lat, lng, radius) in term_rows {
             let name = name.trim().to_string();
-            if let (Some(lat), Some(lng)) = (lat, lng) {
-                if lat != 0.0 || lng != 0.0 {
+            match (lat, lng) {
+                (Some(lat), Some(lng)) if lat != 0.0 || lng != 0.0 => {
                     terminal_names_by_id.insert(id, name.clone());
                     terminals.insert(
                         name.clone(),
@@ -120,6 +123,7 @@ impl ApexDb {
                         },
                     );
                 }
+                _ => unpinned_terminals.push(name),
             }
         }
 
@@ -190,6 +194,7 @@ impl ApexDb {
             terminal_names_by_id,
             dropoffs,
             unpinned_dropoffs: unpinned,
+            unpinned_terminals,
         })
     }
 
@@ -219,6 +224,77 @@ impl ApexDb {
         .fetch_all(&self.pool)
         .await
         .context("loading drop-off service days")?)
+    }
+
+    /// For unpinned terminals: which (vehicle GUID, local day) departed from
+    /// each name since `since_day`. Mirrors `load_dropoff_service_days`.
+    pub async fn load_terminal_service_days(
+        &self,
+        since_day: &str,
+        names: &[String],
+    ) -> Result<Vec<(String, String, String)>> {
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(sqlx::query_as(
+            r#"SELECT DISTINCT pt.terminal, pt.date, c.etit_car_id
+                 FROM parent_trips pt
+                 LEFT JOIN cars c ON c.id = pt.car_id
+                WHERE pt.deleted_at IS NULL
+                  AND pt.date >= $1
+                  AND pt.terminal = ANY($2)
+                  AND c.etit_car_id IS NOT NULL AND c.etit_car_id <> ''"#,
+        )
+        .bind(since_day)
+        .bind(names)
+        .fetch_all(&self.pool)
+        .await
+        .context("loading terminal service days")?)
+    }
+
+    /// Auto-apply a GPS-derived pin to a place that has NO pin. The guard in
+    /// the WHERE clause makes this a no-op if someone pinned it meanwhile —
+    /// this is the proxy's only write into the apex DB, and it can only fill
+    /// blanks, never move an existing pin.
+    pub async fn apply_pin_if_unpinned(
+        &self,
+        kind: &str,
+        name: &str,
+        lat: f64,
+        lng: f64,
+    ) -> Result<bool> {
+        const SQL_TERMINAL: &str = r#"UPDATE terminals
+                  SET latitude = $2, longitude = $3, pin_source = 'gps_suggested',
+                      updated_at = NOW()
+                WHERE name = $1 AND deleted_at IS NULL
+                  AND (latitude IS NULL OR latitude = 0)"#;
+        const SQL_TERMINAL_LEGACY: &str = r#"UPDATE terminals
+                  SET latitude = $2, longitude = $3, updated_at = NOW()
+                WHERE name = $1 AND deleted_at IS NULL
+                  AND (latitude IS NULL OR latitude = 0)"#;
+        const SQL_DROPOFF: &str = r#"UPDATE drop_off_points
+                  SET latitude = $2, longitude = $3, pin_source = 'gps_suggested',
+                      updated_at = NOW()
+                WHERE name = $1 AND deleted_at IS NULL
+                  AND (latitude IS NULL OR latitude = 0)"#;
+
+        let primary = if kind == "terminal" { SQL_TERMINAL } else { SQL_DROPOFF };
+        let res = match sqlx::query(primary).bind(name).bind(lat).bind(lng).execute(&self.pool).await
+        {
+            Ok(r) => r,
+            Err(e) if kind == "terminal" => {
+                // terminals may not have pin_source pre-migration.
+                tracing::debug!(error = %e, "apply_pin with pin_source failed; retrying without");
+                sqlx::query(SQL_TERMINAL_LEGACY)
+                    .bind(name)
+                    .bind(lat)
+                    .bind(lng)
+                    .execute(&self.pool)
+                    .await?
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok(res.rows_affected() > 0)
     }
 
     /// Load all parent trips for the given local dates (YYYY-MM-DD), with

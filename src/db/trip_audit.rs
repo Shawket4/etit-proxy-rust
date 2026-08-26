@@ -318,49 +318,72 @@ impl TripAuditRepo {
         Ok(match_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_matches(
         &self,
         from_day: Option<&str>,
         to_day: Option<&str>,
         status: Option<&str>,
         flagged_only: bool,
+        unreviewed_only: bool,
         company: Option<&str>,
-    ) -> Result<Vec<TripMatchRow>> {
-        let mut sql = String::from(
-            r#"SELECT m.*, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id) AS flag_count
-                 FROM trip_matches m WHERE 1=1"#,
-        );
+        sort: &str,
+        page: i64,
+        per_page: i64,
+    ) -> Result<(Vec<TripMatchRow>, i64)> {
+        let mut filter = String::from(" FROM trip_matches m WHERE 1=1");
         if from_day.is_some() {
-            sql.push_str(" AND m.day_local >= ?");
+            filter.push_str(" AND m.day_local >= ?");
         }
         if to_day.is_some() {
-            sql.push_str(" AND m.day_local <= ?");
+            filter.push_str(" AND m.day_local <= ?");
         }
         if status.is_some() {
-            sql.push_str(" AND m.status = ?");
+            filter.push_str(" AND m.status = ?");
         }
         if company.is_some() {
-            sql.push_str(" AND m.company = ?");
+            filter.push_str(" AND m.company = ?");
         }
         if flagged_only {
-            sql.push_str(" AND EXISTS (SELECT 1 FROM trip_flags f WHERE f.match_id = m.id)");
+            filter.push_str(" AND EXISTS (SELECT 1 FROM trip_flags f WHERE f.match_id = m.id)");
         }
-        sql.push_str(" ORDER BY m.day_local DESC, m.id DESC LIMIT 500");
+        if unreviewed_only {
+            filter.push_str(" AND m.reviewed_at IS NULL");
+        }
 
+        let count_sql = format!("SELECT COUNT(*){filter}");
+        let mut cq = sqlx::query_as::<_, (i64,)>(&count_sql);
+        for v in [from_day, to_day, status, company].into_iter().flatten() {
+            cq = cq.bind(v.to_string());
+        }
+        let (total,) = cq.fetch_one(&self.pool).await?;
+
+        // "severity" ranks what a reviewer should look at first: critical
+        // flags, then how many km over optimal the trip drove.
+        let order = match sort {
+            "severity" => {
+                " ORDER BY (SELECT COUNT(*) FROM trip_flags f
+                             WHERE f.match_id = m.id AND f.severity = 'critical') DESC,
+                          COALESCE(m.actual_km - m.osrm_km, 0) DESC,
+                          m.day_local DESC, m.id DESC"
+            }
+            _ => " ORDER BY m.day_local DESC, m.id DESC",
+        };
+        let page = page.max(1);
+        let per_page = per_page.clamp(1, 200);
+        let sql = format!(
+            "SELECT m.*, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id) AS flag_count{filter}{order} LIMIT ? OFFSET ?"
+        );
         let mut q = sqlx::query_as::<_, TripMatchRow>(&sql);
-        if let Some(v) = from_day {
+        for v in [from_day, to_day, status, company].into_iter().flatten() {
             q = q.bind(v.to_string());
         }
-        if let Some(v) = to_day {
-            q = q.bind(v.to_string());
-        }
-        if let Some(v) = status {
-            q = q.bind(v.to_string());
-        }
-        if let Some(v) = company {
-            q = q.bind(v.to_string());
-        }
-        Ok(q.fetch_all(&self.pool).await?)
+        let rows = q
+            .bind(per_page)
+            .bind((page - 1) * per_page)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok((rows, total))
     }
 
     pub async fn get_match(&self, id: i64) -> Result<Option<TripMatchRow>> {
@@ -452,6 +475,20 @@ impl TripAuditRepo {
         .bind(s.stop_count)
         .bind(scan_run_id)
         .bind(status)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_suggestion_auto_applied(&self, kind: &str, name: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE location_suggestions
+                  SET status = 'auto_applied',
+                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE kind = ? AND name = ? AND status = 'pending'"#,
+        )
+        .bind(kind)
+        .bind(name)
         .execute(&self.pool)
         .await?;
         Ok(())

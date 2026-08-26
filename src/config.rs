@@ -87,6 +87,10 @@ pub struct Config {
     pub trip_flag_duration_ratio: f64,
     pub trip_unplanned_stop_secs: i64,
     pub trip_deviation_m: f64,
+    /// Auto-apply a GPS pin suggestion to an UNPINNED place when its cluster
+    /// has at least this many stops. Corrections to existing pins are never
+    /// auto-applied.
+    pub trip_pin_auto_apply_min_stops: i64,
 }
 
 impl Config {
@@ -183,6 +187,7 @@ impl Config {
         let trip_flag_duration_ratio = parse_or("TRIP_FLAG_DURATION_RATIO", 2.5_f64)?;
         let trip_unplanned_stop_secs = parse_or("TRIP_UNPLANNED_STOP_SECS", 900)?;
         let trip_deviation_m = parse_or("TRIP_DEVIATION_M", 2000.0_f64)?;
+        let trip_pin_auto_apply_min_stops = parse_or("TRIP_PIN_AUTO_APPLY_MIN_STOPS", 5_i64)?;
 
         Ok(Self {
             etit_data_url,
@@ -226,6 +231,7 @@ impl Config {
             trip_flag_duration_ratio,
             trip_unplanned_stop_secs,
             trip_deviation_m,
+            trip_pin_auto_apply_min_stops,
         })
     }
 
