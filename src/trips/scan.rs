@@ -811,8 +811,8 @@ async fn run_mileage_checks(state: &AppState, day: NaiveDate, day_str: &str) {
             return;
         }
     };
-    for v in vehicles {
-        let Ok(Some(hist)) = state.history.get_day(&v.id, day).await else {
+    for v in vehicles.iter() {
+        let Ok(hist) = state.history.for_day(&v.id, day, false).await else {
             continue;
         };
         let pts: Vec<(f64, f64)> = hist.points.iter().map(|p| (p.lat, p.lng)).collect();

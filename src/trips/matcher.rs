@@ -467,6 +467,11 @@ mod tests {
             night_end: chrono::NaiveTime::from_hms_opt(7, 0, 0).unwrap(),
             unplanned_stop_secs: 900,
             duration_ratio_threshold: 1.5,
+            return_cap_secs: 72 * 3600,
+            // Far past every fixture timestamp: the cap has always elapsed,
+            // so tests exercise the final no_return_data path, never the
+            // transient return_pending state.
+            now_ts: i64::MAX / 2,
         }
     }
 
