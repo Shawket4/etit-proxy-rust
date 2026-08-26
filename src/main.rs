@@ -270,4 +270,14 @@ async fn shutdown_signal() {
         _ = ctrl_c    => tracing::info!("ctrl-c received; shutting down"),
         _ = terminate => tracing::info!("SIGTERM received; shutting down"),
     }
+
+    // Graceful shutdown waits for open connections, and SSE streams never
+    // close on their own — without a deadline, `systemctl stop` hangs for
+    // TimeoutStopSec and ends in SIGKILL (observed 2026-08-26). Give the
+    // server a grace window, then leave on our own terms.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tracing::warn!("graceful shutdown exceeded 10s (long-lived SSE clients); exiting now");
+        std::process::exit(0);
+    });
 }

@@ -57,6 +57,27 @@ static GUID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap()
 });
 
+// Post-login pages embed the ids as JS literals, e.g. `staffId: '750e33ed-…'`.
+// Since ~Aug 2026 the SSOCookie itself is encrypted, so this is the primary
+// dynamic source.
+static BODY_STAFFID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)staffid\s*[:=]\s*['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]"#,
+    )
+    .unwrap()
+});
+static BODY_SUBID_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?i)subid\s*[:=]\s*['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]"#,
+    )
+    .unwrap()
+});
+
+/// Neutral placeholder when no id source is available. The data endpoints
+/// authorize via session cookies and ignore the posted ids (verified against
+/// GetTransportersPage: an all-zeros subID returns the tenant's fleet).
+const PLACEHOLDER_GUID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// Snapshot of upstream session state. Cheap to clone.
 #[derive(Debug, Clone, Default)]
 pub struct AuthState {
@@ -98,6 +119,35 @@ pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthS
     let get_headers = get_resp.headers().clone();
     let html = get_resp.text().await.context("read login page body")?;
 
+    // Session cookies accumulated across the flow. The client runs with
+    // `cookie_store(false)` (cross-domain cookies are managed manually), so
+    // every subsequent step must carry these explicitly — since ~Aug 2026
+    // the server binds login authorization to the server-side session, and a
+    // cookie-less POST produces a session that data pages refuse to render.
+    let mut all_cookies = std::collections::HashMap::new();
+
+    fn merge(all: &mut std::collections::HashMap<String, String>, h: &reqwest::header::HeaderMap) {
+        for val in h.get_all(reqwest::header::SET_COOKIE).iter() {
+            if let Ok(s) = val.to_str() {
+                if let Some(pair) = s.split(';').next() {
+                    let mut parts = pair.splitn(2, '=');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                        all.insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let build_cookie_header = |all: &std::collections::HashMap<String, String>| {
+        all.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+
+    merge(&mut all_cookies, &get_headers);
+
     let viewstate = scrape(&html, &VIEWSTATE_RE_FWD, &VIEWSTATE_RE_REV)
         .ok_or_else(|| anyhow!("could not scrape __VIEWSTATE"))?;
     let generator = scrape(&html, &GENERATOR_RE_FWD, &GENERATOR_RE_REV)
@@ -118,9 +168,11 @@ pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthS
     let post_resp = http
         .post(&login_url)
         .header(REFERER, &login_url)
+        .header(USER_AGENT, USER_AGENT_VALUE)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded; charset=UTF-8")
         .header("X-MicrosoftAjax", "Delta=true")
         .header("X-Requested-With", "XMLHttpRequest")
+        .header(reqwest::header::COOKIE, build_cookie_header(&all_cookies))
         .form(&form)
         .send()
         .await
@@ -129,6 +181,7 @@ pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthS
     let post_status        = post_resp.status();
     let post_headers       = post_resp.headers().clone();
     let post_body          = post_resp.text().await.unwrap_or_default();
+    merge(&mut all_cookies, &post_headers);
 
     if !post_status.is_success() && !post_status.is_redirection() {
         return Err(anyhow!(
@@ -153,18 +206,19 @@ pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthS
         .header(REFERER, &login_url)
         .header(USER_AGENT, USER_AGENT_VALUE)
         .header(ACCEPT, "text/html,application/xhtml+xml,*/*")
+        .header(reqwest::header::COOKIE, build_cookie_header(&all_cookies))
         .send()
         .await
         .context("GET post-login redirect")?;
 
     let redirect_headers = redirect_resp.headers().clone();
+    merge(&mut all_cookies, &redirect_headers);
     let sso_cookie = extract_set_cookie(&redirect_headers, "SSOCookie")
         .or_else(|| extract_set_cookie(&post_headers, "SSOCookie"))
         .unwrap_or_default();
 
     if sso_cookie.is_empty() {
-        let seen_cookies: Vec<String> = redirect_resp
-            .headers()
+        let seen_cookies: Vec<String> = redirect_headers
             .get_all(reqwest::header::SET_COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
@@ -177,39 +231,91 @@ pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthS
         ));
     }
 
-    // Collect all cookies from all steps.
-    let mut all_cookies = std::collections::HashMap::new();
-    
-    // Helper to merge cookies from a HeaderMap.
-    let mut merge = |h: &reqwest::header::HeaderMap| {
-        for val in h.get_all(reqwest::header::SET_COOKIE).iter() {
-            if let Ok(s) = val.to_str() {
-                if let Some(pair) = s.split(';').next() {
-                    let mut parts = pair.splitn(2, '=');
-                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
-                        all_cookies.insert(k.trim().to_string(), v.trim().to_string());
-                    }
-                }
-            }
+    // The redirect page body embeds staffId (and sometimes subId) as JS
+    // literals — needed since the SSOCookie value became encrypted. The
+    // first GET is a 302 stub whose *headers* carry the auth cookies (no
+    // cookie jar, redirect policy none); one repeat GET carrying the merged
+    // cookies renders the real page.
+    let mut redirect_body = redirect_resp.text().await.unwrap_or_default();
+    if !redirect_body.contains("taffId") {
+        let sent_names: Vec<&String> = all_cookies.keys().collect();
+        tracing::debug!(?sent_names, "follow-up GET for id scraping");
+        let resp2 = http
+            .get(&follow_url)
+            .header(REFERER, &login_url)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .header(ACCEPT, "text/html,application/xhtml+xml,*/*")
+            .header(reqwest::header::COOKIE, build_cookie_header(&all_cookies))
+            .send()
+            .await;
+        if let Ok(resp2) = resp2 {
+            tracing::debug!(status = %resp2.status(), "follow-up GET response");
+            merge(&mut all_cookies, resp2.headers());
+            redirect_body = resp2.text().await.unwrap_or_default();
+        }
+    }
+    tracing::debug!(
+        body_len = redirect_body.len(),
+        mentions_staffid = redirect_body.matches("taffId").count(),
+        "post-login page body for id scraping"
+    );
+
+    // ---- Step 4: warm up the data host --------------------------------------
+    // Since the ~Aug 2026 upstream change, GetAllHistoryData returns empty
+    // until the data host has rendered one page for this session — the
+    // parent-domain cookies authorize it, but the server-side data session
+    // is only initialized by a page visit. Best-effort: losing it degrades
+    // history, not login.
+    let warmup_url = format!("{}/WebPages/maps.aspx", cfg.etit_data_url);
+    let mut maps_body = String::new();
+    match http
+        .get(&warmup_url)
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(ACCEPT, "text/html,application/xhtml+xml,*/*")
+        .header(reqwest::header::COOKIE, build_cookie_header(&all_cookies))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            merge(&mut all_cookies, resp.headers());
+            maps_body = resp.text().await.unwrap_or_default();
+            tracing::debug!(%status, body_len = maps_body.len(), "data-host warmup");
+        }
+        Err(e) => tracing::warn!(error = %e, "data-host warmup failed; history may be empty"),
+    }
+
+    let cookie_header = build_cookie_header(&all_cookies);
+
+    // Id extraction is best-effort: the data endpoints authorize via the
+    // session cookies and ignore the posted ids, so a failed extraction must
+    // never fail the login. Priority: plaintext SSOCookie (legacy) → page
+    // body JS literals → ETIT_SUB_ID/ETIT_STAFF_ID env overrides → zeros.
+    let (sub_id, staff_id) = match parse_sso_cookie(&sso_cookie) {
+        Some(pair) => pair,
+        None => {
+            let body_staff = scrape_body_id(&redirect_body, &BODY_STAFFID_RE)
+                .or_else(|| scrape_body_id(&maps_body, &BODY_STAFFID_RE));
+            let body_sub = scrape_body_id(&redirect_body, &BODY_SUBID_RE)
+                .or_else(|| scrape_body_id(&maps_body, &BODY_SUBID_RE));
+            let sub = cfg
+                .etit_sub_id
+                .clone()
+                .or(body_sub)
+                .unwrap_or_else(|| PLACEHOLDER_GUID.to_string());
+            let staff = cfg
+                .etit_staff_id
+                .clone()
+                .or(body_staff)
+                .unwrap_or_else(|| PLACEHOLDER_GUID.to_string());
+            tracing::warn!(
+                sub_id = %sub,
+                staff_id = %staff,
+                "SSOCookie is opaque (encrypted); using fallback ids"
+            );
+            (sub, staff)
         }
     };
-
-    merge(&get_headers);
-    merge(&post_headers);
-    merge(&redirect_headers);
-
-    let cookie_header = all_cookies
-        .into_iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    let (sub_id, staff_id) = parse_sso_cookie(&sso_cookie).ok_or_else(|| {
-        anyhow!(
-            "could not extract subID/staffID from SSOCookie: {}",
-            truncate(&sso_cookie, 200)
-        )
-    })?;
 
     Ok(AuthState {
         sub_id,
@@ -258,6 +364,12 @@ pub(crate) fn extract_page_redirect(body: &str) -> Option<String> {
             .decode_utf8_lossy()
             .into_owned(),
     )
+}
+
+pub(crate) fn scrape_body_id(body: &str, re: &Regex) -> Option<String> {
+    re.captures(body)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_lowercase())
 }
 
 pub(crate) fn scrape(html: &str, primary: &Regex, fallback: &Regex) -> Option<String> {
@@ -342,6 +454,37 @@ mod tests {
         let (s, t) = parse_sso_cookie(raw).unwrap();
         assert_eq!(s, "ca53d5de-cf14-ea11-80ee-0025b500010d");
         assert_eq!(t, "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn encrypted_sso_cookie_does_not_parse() {
+        // Post-Aug-2026 cookies are opaque base64 — the parser must return
+        // None (login then falls back to page-body scraping).
+        let raw = "8Y0QoTrzLuLs87/69p8qTF7Jybn9MRuYzO3m7up052v115kfIwgR9D2Qvg";
+        assert!(parse_sso_cookie(raw).is_none());
+    }
+
+    #[test]
+    fn scrapes_ids_from_page_body_js() {
+        let body = r#"var x = ({ pageSize: 10, staffId: '750E33ED-6BA0-E811-80DE-0025B500010D' }),
+                      other = { subId: "778cf430-40e1-e611-80d4-0025b500010d" };"#;
+        assert_eq!(
+            scrape_body_id(body, &BODY_STAFFID_RE).as_deref(),
+            Some("750e33ed-6ba0-e811-80de-0025b500010d"),
+        );
+        assert_eq!(
+            scrape_body_id(body, &BODY_SUBID_RE).as_deref(),
+            Some("778cf430-40e1-e611-80d4-0025b500010d"),
+        );
+    }
+
+    #[test]
+    fn body_scrape_ignores_js_function_names() {
+        // The real page defines `StaffIdSubId: function(...)` — a name, not a
+        // value. It must not match.
+        let body = "proxies.Branches.StaffIdSubId= function(a,b,c){};";
+        assert!(scrape_body_id(body, &BODY_STAFFID_RE).is_none());
+        assert!(scrape_body_id(body, &BODY_SUBID_RE).is_none());
     }
 
     #[test]

@@ -16,6 +16,11 @@ pub struct Config {
     pub etit_login_url: String,
     pub etit_username: String,
     pub etit_password: String,
+    /// Optional overrides for the tenant/staff ids posted to data endpoints.
+    /// Needed only if ETIT ever validates them again AND the post-login page
+    /// stops embedding them; the server currently ignores the posted values.
+    pub etit_sub_id: Option<String>,
+    pub etit_staff_id: Option<String>,
 
     // ---- HTTP server --------------------------------------------------------
     pub bind_addr: String,
@@ -64,6 +69,8 @@ impl Config {
         let etit_data_url  = trimmed_env("ETIT_DATA_URL")?;
         let etit_username  = required_env("ETIT_USERNAME")?;
         let etit_password  = required_env("ETIT_PASSWORD")?;
+        let etit_sub_id    = optional_env("ETIT_SUB_ID");
+        let etit_staff_id  = optional_env("ETIT_STAFF_ID");
 
         let bind_addr =
             std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -123,6 +130,8 @@ impl Config {
             etit_login_url,
             etit_username,
             etit_password,
+            etit_sub_id,
+            etit_staff_id,
             bind_addr,
             admin_token,
             cors_origins,
@@ -160,6 +169,13 @@ fn required_env(key: &str) -> Result<String> {
 
 fn trimmed_env(key: &str) -> Result<String> {
     Ok(required_env(key)?.trim_end_matches('/').to_string())
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn secs_or(key: &str, default: u64) -> Result<Duration> {
