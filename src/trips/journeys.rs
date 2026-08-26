@@ -45,9 +45,28 @@ pub fn partition_journeys(
     points: &[PointTS],
     terminals: &[Place],
     dropoffs: &[Place],
+    depart_terminals: &std::collections::HashSet<String>,
     window_start: i64,
     window_end: i64,
 ) -> Vec<Journey> {
+    // A place can be a terminal in general but one of THIS day's delivery
+    // destinations (dual-role: same name/location). Arriving there is then a
+    // delivery, not a journey boundary — exclude it from the splitting set,
+    // unless some trip today also DEPARTS from it (ambiguous; terminal role
+    // wins so departures still work).
+    let terminals: Vec<Place> = terminals
+        .iter()
+        .filter(|t| {
+            depart_terminals.contains(&t.name)
+                || !dropoffs.iter().any(|d| {
+                    d.name == t.name
+                        || crate::zones::geo::haversine_m(d.lat, d.lng, t.lat, t.lng) < 100.0
+                })
+        })
+        .cloned()
+        .collect();
+    let terminals = terminals.as_slice();
+
     // All terminal visits, tagged and chronological. Terminals and drop-offs
     // compete for points in one arena, so overlapping fences (two pins across
     // the street) can't both claim the same dwell.
@@ -227,6 +246,7 @@ mod tests {
             &points,
             &[term.clone()],
             &[drop_a.clone(), drop_b.clone()],
+            &std::collections::HashSet::from([term.name.clone()]),
             0,
             i64::MAX,
         );
@@ -252,8 +272,14 @@ mod tests {
             ((30.20, 31.40), 8_000, 10_000),
             ((30.10, 31.70), 14_000, 16_000),
         ]);
-        let journeys =
-            partition_journeys(&points, &[term_a.clone(), term_b.clone()], &[drop], 0, i64::MAX);
+        let journeys = partition_journeys(
+            &points,
+            &[term_a.clone(), term_b.clone()],
+            &[drop],
+            &std::collections::HashSet::from([term_a.name.clone()]),
+            0,
+            i64::MAX,
+        );
         assert_eq!(journeys.len(), 1);
 
         let t = trip(&term_b, "A", None); // registered from the OTHER terminal
@@ -275,11 +301,46 @@ mod tests {
             ((30.1000, 31.7000), 15_000, 18_000),                  // back at terminal
         ]);
 
-        let journeys =
-            partition_journeys(&points, &[term.clone()], &[x.clone()], 0, i64::MAX);
+        let journeys = partition_journeys(
+            &points,
+            &[term.clone()],
+            &[x.clone()],
+            &std::collections::HashSet::from([term.name.clone()]),
+            0,
+            i64::MAX,
+        );
         assert_eq!(journeys.len(), 1, "phantom journeys: {journeys:?}");
         assert_eq!(journeys[0].dropoffs, vec!["X".to_string()]);
         assert!(journeys[0].end.is_some());
+    }
+
+    #[test]
+    fn dual_role_place_is_a_delivery_not_a_journey_boundary() {
+        // "انابيب البترول بدر" is a terminal in general, but today's trip
+        // DELIVERS to it from بدر. Arriving there must not end the journey;
+        // the journey ends back at بدر.
+        let badr = place("بدر", 30.1000, 31.7000);
+        let pipelines = place("انابيب البترول بدر", 30.1600, 31.7600);
+        let dual_dropoff = place("انابيب البترول بدر", 30.1600, 31.7600);
+
+        let points = pts(&[
+            ((30.1000, 31.7000), 1_000, 4_000),   // load at بدر
+            ((30.1600, 31.7600), 8_000, 11_000),  // deliver at the pipelines
+            ((30.1000, 31.7000), 15_000, 18_000), // back at بدر
+        ]);
+
+        let journeys = partition_journeys(
+            &points,
+            &[badr.clone(), pipelines.clone()],
+            &[dual_dropoff],
+            &std::collections::HashSet::from([badr.name.clone()]),
+            0,
+            i64::MAX,
+        );
+        assert_eq!(journeys.len(), 1, "{journeys:?}");
+        assert_eq!(journeys[0].terminal_name, "بدر");
+        assert_eq!(journeys[0].dropoffs, vec!["انابيب البترول بدر".to_string()]);
+        assert!(journeys[0].end.is_some(), "journey must close back at بدر");
     }
 
     #[test]
@@ -292,7 +353,14 @@ mod tests {
             ((29.95, 31.55), 20_000, 22_000),
             ((30.10, 31.70), 26_000, 28_000),
         ]);
-        let journeys = partition_journeys(&points, &[term.clone()], &[], 0, i64::MAX);
+        let journeys = partition_journeys(
+            &points,
+            &[term.clone()],
+            &[],
+            &std::collections::HashSet::from([term.name.clone()]),
+            0,
+            i64::MAX,
+        );
         assert_eq!(journeys.len(), 2);
 
         let t1 = trip(&term, "X", None);

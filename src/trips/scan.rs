@@ -205,10 +205,15 @@ async fn do_run_scan(
                 }
             }
 
+            let depart_terminals: std::collections::HashSet<String> = day_trips
+                .iter()
+                .filter_map(|t| t.terminal.as_ref().map(|p| p.name.clone()))
+                .collect();
             let journeys = super::journeys::partition_journeys(
                 &points,
                 &terminals,
                 &day_dropoffs,
+                &depart_terminals,
                 window_start,
                 window_end,
             );

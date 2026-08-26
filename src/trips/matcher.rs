@@ -124,7 +124,7 @@ pub fn match_trip(input: &MatchInput, cfg: &MatcherConfig) -> MatchOutcome {
     for kp in input.known_places {
         if !arena
             .iter()
-            .any(|a| a.name == kp.name || haversine_m(a.lat, a.lng, kp.lat, kp.lng) < 1.0)
+            .any(|a| a.name == kp.name || haversine_m(a.lat, a.lng, kp.lat, kp.lng) < 100.0)
         {
             arena.push(kp.clone());
         }
