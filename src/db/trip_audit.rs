@@ -669,6 +669,35 @@ impl TripAuditRepo {
         Ok(())
     }
 
+    /// Mark live suggestions superseded when a human has since re-pinned the
+    /// place outside the suggestion flow (pin_source no longer gps-derived,
+    /// or the pin moved away from the suggested point). Runs each scan so
+    /// the Locations queue never shows ghosts.
+    pub async fn supersede_suggestion(&self, kind: &str, name: &str) -> Result<bool> {
+        let res = sqlx::query(
+            r#"UPDATE location_suggestions
+                  SET status = 'accepted',
+                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE kind = ? AND name = ? AND status IN ('pending', 'auto_applied')"#,
+        )
+        .bind(kind)
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// All suggestions still shown in the queue, for reconciliation.
+    pub async fn live_suggestions(&self) -> Result<Vec<(String, String, f64, f64)>> {
+        Ok(sqlx::query_as(
+            r#"SELECT kind, name, suggested_lat, suggested_lng
+                 FROM location_suggestions
+                WHERE status IN ('pending', 'auto_applied')"#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn list_suggestions(&self, status: Option<&str>) -> Result<Vec<SuggestionRow>> {
         let rows = match status {
             Some(s) => {

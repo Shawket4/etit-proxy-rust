@@ -226,6 +226,24 @@ impl ApexDb {
         .context("loading drop-off service days")?)
     }
 
+    /// Current pin + provenance for one place, for suggestion reconciliation.
+    pub async fn place_pin(
+        &self,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<(Option<f64>, Option<f64>, String)>> {
+        let sql = if kind == "terminal" {
+            r#"SELECT CAST(latitude AS float8), CAST(longitude AS float8),
+                      COALESCE(pin_source, '')
+                 FROM terminals WHERE name = $1 AND deleted_at IS NULL LIMIT 1"#
+        } else {
+            r#"SELECT CAST(latitude AS float8), CAST(longitude AS float8),
+                      COALESCE(pin_source, '')
+                 FROM drop_off_points WHERE name = $1 AND deleted_at IS NULL LIMIT 1"#
+        };
+        Ok(sqlx::query_as(sql).bind(name).fetch_optional(&self.pool).await?)
+    }
+
     /// For unpinned terminals: which (vehicle GUID, local day) departed from
     /// each name since `since_day`. Mirrors `load_dropoff_service_days`.
     pub async fn load_terminal_service_days(

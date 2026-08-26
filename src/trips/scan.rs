@@ -739,6 +739,35 @@ async fn do_run_scan(
     }
 
     // ---- Calibration -----------------------------------------------------------
+    // Reconcile the suggestion queue with reality: a human may have
+    // re-pinned a place outside the queue's own Confirm/Adjust flow. Any
+    // live suggestion whose target now carries a non-GPS pin_source — or
+    // whose pin sits far from the suggested point — is superseded so the
+    // Locations queue never shows ghosts.
+    if let Some(apex) = state.apex_db.as_ref() {
+        if let Ok(live) = state.trip_repo.live_suggestions().await {
+            for (kind, name, slat, slng) in live {
+                match apex.place_pin(&kind, &name).await {
+                    Ok(Some((Some(lat), Some(lng), source)))
+                        if (lat != 0.0 || lng != 0.0)
+                            && (source == "manual"
+                                || haversine_m(lat, lng, slat, slng) > 150.0) =>
+                    {
+                        if state
+                            .trip_repo
+                            .supersede_suggestion(&kind, &name)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            tracing::info!(kind, name = %name, "suggestion superseded by manual pin");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     match run_calibration(state, run_id, &catalog, today).await {
         Ok(n) => summary.suggestions_made = n,
         Err(e) => tracing::warn!(error = %e, "calibration pass failed"),
