@@ -71,6 +71,8 @@ pub struct TripMatchRow {
     /// Filled by list queries: number of flags on this match.
     #[sqlx(default)]
     pub flag_count: i64,
+    /// Count of critical-severity flags — drives the queue's severity chip.
+    pub critical_count: i64,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -396,7 +398,7 @@ impl TripAuditRepo {
         let page = page.max(1);
         let per_page = per_page.clamp(1, 200);
         let sql = format!(
-            "SELECT m.*, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id) AS flag_count{filter}{order} LIMIT ? OFFSET ?"
+            "SELECT m.*, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id) AS flag_count, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id AND f.severity = 'critical') AS critical_count{filter}{order} LIMIT ? OFFSET ?"
         );
         let mut q = sqlx::query_as::<_, TripMatchRow>(&sql);
         for v in [from_day, to_day, status, company].into_iter().flatten() {
@@ -412,7 +414,8 @@ impl TripAuditRepo {
 
     pub async fn get_match(&self, id: i64) -> Result<Option<TripMatchRow>> {
         Ok(sqlx::query_as::<_, TripMatchRow>(
-            r#"SELECT m.*, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id) AS flag_count
+            r#"SELECT m.*, (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id) AS flag_count,
+                      (SELECT COUNT(*) FROM trip_flags f WHERE f.match_id = m.id AND f.severity = 'critical') AS critical_count
                  FROM trip_matches m WHERE m.id = ?"#,
         )
         .bind(id)
