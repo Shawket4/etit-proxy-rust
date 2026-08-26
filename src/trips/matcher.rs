@@ -31,9 +31,6 @@ const VISIT_GAP_SECS: i64 = 300;
 /// through a station's fence on the way somewhere else takes seconds;
 /// loading/unloading takes many minutes.
 const MIN_VISIT_DWELL_SECS: i64 = 300;
-/// The return terminal must be reached within this window after the last
-/// delivery, otherwise we treat return data as absent.
-const RETURN_WINDOW_SECS: i64 = 24 * 3600;
 /// Margin added to a place's radius when deciding whether a long stop was
 /// "at" a known location (drivers park at the fence edge).
 const STOP_EXEMPT_MARGIN_M: f64 = 150.0;
@@ -44,6 +41,10 @@ pub struct MatcherConfig {
     pub night_end: chrono::NaiveTime,
     pub unplanned_stop_secs: i64,
     pub duration_ratio_threshold: f64,
+    /// Give up waiting for a terminal return after this long (default 72h).
+    pub return_cap_secs: i64,
+    /// "Now" as epoch seconds — decides return_pending vs no_return_data.
+    pub now_ts: i64,
 }
 
 /// A long stop extracted from history, in epoch seconds.
@@ -79,6 +80,7 @@ pub fn match_trip(input: &MatchInput, cfg: &MatcherConfig) -> MatchOutcome {
         start_ts: None,
         end_ts: None,
         returned_to_terminal: false,
+        return_pending: false,
         deliveries_expected: planned.deliveries.len() as i64,
         deliveries_visited: 0,
         legs: Vec::new(),
@@ -241,12 +243,17 @@ pub fn match_trip(input: &MatchInput, cfg: &MatcherConfig) -> MatchOutcome {
     }
 
     // ---- Return leg: first entry into ANY terminal after the last drop ------
+    // The natural end of the return is the next terminal entry (the next
+    // trip starts by loading at one), capped at `return_cap_secs`. When no
+    // entry is found the trip is *open* until the cap passes: nightly scans
+    // re-audit pending days, so a Qena run that returns 30h later gets its
+    // return leg on a later pass.
     let (last_idx, last_visit) = sequence.last().unwrap();
     let mut trip_end = last_visit.exit;
     let mut best_return: Option<(&Place, i64)> = None;
     for t in input.terminals {
         for v in detect_visits(input.points, t, last_visit.exit) {
-            if v.entry > last_visit.exit && v.entry - last_visit.exit <= RETURN_WINDOW_SECS {
+            if v.entry > last_visit.exit && v.entry - last_visit.exit <= cfg.return_cap_secs {
                 if best_return.map_or(true, |(_, e)| v.entry < e) {
                     best_return = Some((t, v.entry));
                 }
@@ -267,12 +274,24 @@ pub fn match_trip(input: &MatchInput, cfg: &MatcherConfig) -> MatchOutcome {
         ));
         outcome.returned_to_terminal = true;
         trip_end = ret_entry;
+    } else if cfg.now_ts - last_visit.exit < cfg.return_cap_secs {
+        // Still inside the cap — the truck may simply not be back yet.
+        outcome.return_pending = true;
+        outcome.flags.push(Flag {
+            flag_type: "return_pending",
+            severity: "info",
+            details: serde_json::json!({
+                "detail": "trip still open — no terminal entry yet; will re-audit",
+                "cap_hours": cfg.return_cap_secs / 3600,
+            }),
+        });
     } else {
         outcome.flags.push(Flag {
             flag_type: "no_return_data",
             severity: "info",
             details: serde_json::json!({
-                "detail": "no terminal entry within 24h after the last delivery",
+                "detail": "no terminal entry within the return cap after the last delivery",
+                "cap_hours": cfg.return_cap_secs / 3600,
             }),
         });
     }
@@ -339,11 +358,12 @@ fn build_leg(
     arrive_ts: i64,
     cfg: &MatcherConfig,
 ) -> super::MatchedLeg {
-    let leg_points: Vec<(f64, f64)> = points
+    let raw_points: Vec<(f64, f64, i64)> = points
         .iter()
         .filter(|p| p.ts >= depart_ts && p.ts <= arrive_ts)
-        .map(|p| (p.lat, p.lng))
+        .map(|p| (p.lat, p.lng, p.ts))
         .collect();
+    let leg_points: Vec<(f64, f64)> = raw_points.iter().map(|&(la, ln, _)| (la, ln)).collect();
 
     let actual_km = super::geo::track_length_km(&leg_points, MAX_JUMP_M);
     let actual_geometry = encode_track(&leg_points);
@@ -365,6 +385,9 @@ fn build_leg(
         actual_geometry,
         osrm_geometry: String::new(),
         flag_idx: Vec::new(),
+        raw_points,
+        distance_method: "chord",
+        off_route_pct: None,
     }
 }
 
@@ -416,7 +439,7 @@ fn detect_visits(points: &[PointTS], place: &Place, not_before: i64) -> Vec<Visi
     visits
 }
 
-fn encode_track(points: &[(f64, f64)]) -> String {
+pub(crate) fn encode_track(points: &[(f64, f64)]) -> String {
     use crate::domain::history::encode_polyline;
     use crate::domain::HistoryPoint;
     let hp: Vec<HistoryPoint> = points

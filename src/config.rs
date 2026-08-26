@@ -91,6 +91,19 @@ pub struct Config {
     /// has at least this many stops. Corrections to existing pins are never
     /// auto-applied.
     pub trip_pin_auto_apply_min_stops: i64,
+    /// Stop waiting for a trip's terminal return after this long.
+    pub trip_return_cap_secs: i64,
+    /// Accept a map-matched leg distance when the matcher covered at least
+    /// this fraction of the trace points.
+    pub trip_match_min_coverage: f64,
+    /// Off-optimal fraction of a matched route above which a deviation flag
+    /// is raised (paired with the costs-distance condition).
+    pub trip_off_route_flag_pct: f64,
+    /// Fixed allowed dwell points (garages): (lat, lng, radius_m). A stop
+    /// inside one is never flagged, and a dwell above
+    /// `trip_allowed_point_dwell_secs` routes the leg's optimal via it.
+    pub trip_allowed_points: Vec<(f64, f64, f64)>,
+    pub trip_allowed_point_dwell_secs: i64,
 }
 
 impl Config {
@@ -188,6 +201,26 @@ impl Config {
         let trip_unplanned_stop_secs = parse_or("TRIP_UNPLANNED_STOP_SECS", 900)?;
         let trip_deviation_m = parse_or("TRIP_DEVIATION_M", 2000.0_f64)?;
         let trip_pin_auto_apply_min_stops = parse_or("TRIP_PIN_AUTO_APPLY_MIN_STOPS", 5_i64)?;
+        let trip_return_cap_secs = parse_or("TRIP_RETURN_CAP_HOURS", 72_i64)?.max(1) * 3600;
+        let trip_match_min_coverage = parse_or("TRIP_MATCH_MIN_COVERAGE", 0.85_f64)?;
+        let trip_off_route_flag_pct = parse_or("TRIP_OFF_ROUTE_FLAG_PCT", 0.25_f64)?;
+        // "lat,lng[,radius_m];lat,lng[,radius_m]" — radius defaults to 500 m.
+        let trip_allowed_points = std::env::var("TRIP_ALLOWED_POINTS")
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|entry| {
+                let parts: Vec<&str> = entry.split(',').map(str::trim).collect();
+                if parts.len() < 2 {
+                    return None;
+                }
+                let lat = parts[0].parse::<f64>().ok()?;
+                let lng = parts[1].parse::<f64>().ok()?;
+                let radius = parts.get(2).and_then(|r| r.parse::<f64>().ok()).unwrap_or(500.0);
+                Some((lat, lng, radius))
+            })
+            .collect::<Vec<_>>();
+        let trip_allowed_point_dwell_secs =
+            parse_or("TRIP_ALLOWED_POINT_DWELL_SECS", 20 * 60_i64)?;
 
         Ok(Self {
             etit_data_url,
@@ -232,6 +265,11 @@ impl Config {
             trip_unplanned_stop_secs,
             trip_deviation_m,
             trip_pin_auto_apply_min_stops,
+            trip_return_cap_secs,
+            trip_match_min_coverage,
+            trip_off_route_flag_pct,
+            trip_allowed_points,
+            trip_allowed_point_dwell_secs,
         })
     }
 

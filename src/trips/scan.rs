@@ -94,12 +94,32 @@ async fn do_run_scan(
 
     // ---- Which days ----------------------------------------------------------
     let today = crate::domain::time::today_local(tz);
-    let dates: Vec<NaiveDate> = match dates {
+    let mut dates: Vec<NaiveDate> = match dates {
         Some(d) if !d.is_empty() => d,
-        _ => (1..=state.cfg.trip_scan_lookback_days.max(1) as u64)
-            .filter_map(|i| today.checked_sub_days(Days::new(i)))
-            .collect(),
+        _ => {
+            let mut days: Vec<NaiveDate> = (1..=state.cfg.trip_scan_lookback_days.max(1) as u64)
+                .filter_map(|i| today.checked_sub_days(Days::new(i)))
+                .collect();
+            // Open trips (return_pending) from recent days get re-audited
+            // until their return shows up or the cap passes.
+            match state.trip_repo.days_with_pending_returns(4).await {
+                Ok(pending) => {
+                    for d in pending {
+                        if let Ok(nd) = NaiveDate::parse_from_str(&d, "%Y-%m-%d") {
+                            if !days.contains(&nd) {
+                                tracing::info!(day = %d, "re-auditing day with open returns");
+                                days.push(nd);
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "loading pending-return days failed"),
+            }
+            days
+        }
     };
+    dates.sort();
+    dates.dedup();
     summary.days_scanned = dates.len() as i64;
     let date_strs: Vec<String> = dates.iter().map(|d| d.format("%Y-%m-%d").to_string()).collect();
 
@@ -113,7 +133,15 @@ async fn do_run_scan(
         by_vehicle.entry(trip.etit_car_id.clone()).or_default().push(trip);
     }
 
-    let known_places = catalog.all_places();
+    let mut known_places = catalog.all_places();
+    for (i, (lat, lng, radius)) in state.cfg.trip_allowed_points.iter().enumerate() {
+        known_places.push(super::Place {
+            name: format!("allowed-point-{}", i + 1),
+            lat: *lat,
+            lng: *lng,
+            radius_m: *radius,
+        });
+    }
     let terminals: Vec<_> = catalog.terminals.values().cloned().collect();
     let matcher_cfg = MatcherConfig {
         tz,
@@ -121,6 +149,8 @@ async fn do_run_scan(
         night_end: state.cfg.tanker_night_end,
         unplanned_stop_secs: state.cfg.trip_unplanned_stop_secs,
         duration_ratio_threshold: state.cfg.trip_flag_duration_ratio,
+        return_cap_secs: state.cfg.trip_return_cap_secs,
+        now_ts: Utc::now().timestamp(),
     };
 
     for (vehicle_id, mut trips) in by_vehicle {
@@ -163,21 +193,93 @@ async fn do_run_scan(
             // ---- OSRM enrichment (only for legs we detected) ------------------
             let mut osrm_flags: Vec<(Flag, Option<usize>)> = Vec::new();
             for (leg_pos, leg) in outcome.legs.iter_mut().enumerate() {
+                // Map-match the leg's raw trace onto the road network. When
+                // the match covers enough of the trace and lands in a sane
+                // band around the chord-sum, the matched road distance
+                // replaces it (and the clean geometry replaces the zigzag).
+                if leg.raw_points.len() >= 5 {
+                    match state.osrm.match_trace(&leg.raw_points).await {
+                        Ok(m) => {
+                            let chord = leg.actual_km;
+                            let sane = chord < 0.5
+                                || (m.distance_km >= chord * 0.7 && m.distance_km <= chord * 1.6);
+                            if m.coverage >= state.cfg.trip_match_min_coverage && sane {
+                                leg.actual_km = m.distance_km;
+                                leg.distance_method = "matched";
+                                let joined: Vec<(f64, f64)> = m
+                                    .geometries
+                                    .iter()
+                                    .flat_map(|g| super::geo::decode_polyline(g))
+                                    .collect();
+                                if !joined.is_empty() {
+                                    leg.actual_geometry = super::matcher::encode_track(&joined);
+                                }
+                            } else {
+                                tracing::debug!(
+                                    leg = leg.seq,
+                                    coverage = m.coverage,
+                                    matched_km = m.distance_km,
+                                    chord_km = chord,
+                                    "match rejected; keeping chord distance"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(leg = leg.seq, error = %e, "map match failed; keeping chord");
+                        }
+                    }
+                }
+
+                // Dwells at allowed points (garages) inside this leg: exempt
+                // by definition, and the optimal must route via them so the
+                // detour isn't billed as inefficiency.
+                let via: Vec<(f64, f64)> = stops
+                    .iter()
+                    .filter(|st| {
+                        st.from >= leg.depart_ts
+                            && st.to <= leg.arrive_ts
+                            && st.to - st.from >= state.cfg.trip_allowed_point_dwell_secs
+                    })
+                    .filter(|st| {
+                        state
+                            .cfg
+                            .trip_allowed_points
+                            .iter()
+                            .any(|(la, ln, r)| haversine_m(st.lat, st.lng, *la, *ln) <= *r)
+                    })
+                    .map(|st| (st.lat, st.lng))
+                    .collect();
+                if !via.is_empty() {
+                    osrm_flags.push((
+                        Flag {
+                            flag_type: "allowed_stop",
+                            severity: "info",
+                            details: serde_json::json!({
+                                "leg_seq": leg.seq,
+                                "detail": "dwell at an allowed point; optimal routed via it",
+                                "count": via.len(),
+                            }),
+                        },
+                        Some(leg_pos),
+                    ));
+                }
+
                 match state
                     .osrm
-                    .route(leg.from_coords, leg.to_coords, !leg.night_window)
+                    .route(leg.from_coords, leg.to_coords, &via, !leg.night_window)
                     .await
                 {
                     Ok(route) => {
                         leg.osrm_km = Some(route.distance_km);
                         leg.osrm_secs = Some(route.duration_secs);
 
-                        // Corridor deviation against the optimal geometry.
-                        // Use the 95th percentile of per-point deviations, not
-                        // the max: a single GPS glitch shouldn't flag a leg.
                         let track = super::geo::decode_polyline(&route.geometry);
                         let leg_points: Vec<(f64, f64)> =
                             super::geo::decode_polyline(&leg.actual_geometry);
+                        // Corridor deviation. For matched legs: the fraction
+                        // of the (road-true) actual path off the optimal
+                        // corridor. For chord legs: p95 of per-point
+                        // deviations, so a single GPS glitch can't flag.
                         let mut devs: Vec<f64> = leg_points
                             .iter()
                             .map(|(la, ln)| super::geo::distance_to_track_m(*la, *ln, &track))
@@ -189,6 +291,11 @@ async fn do_run_scan(
                             devs[((devs.len() - 1) as f64 * 0.95) as usize]
                         };
                         leg.max_deviation_m = Some(p95);
+                        if leg.distance_method == "matched" && !devs.is_empty() {
+                            let off = devs.iter().filter(|d| **d > 150.0).count();
+                            leg.off_route_pct =
+                                Some((off as f64 / devs.len() as f64 * 1000.0).round() / 1000.0);
+                        }
                         leg.osrm_geometry = route.geometry;
 
                         if route.distance_km > 0.1 {
@@ -228,7 +335,13 @@ async fn do_run_scan(
                         // distance.
                         let costs_distance =
                             route.distance_km > 0.1 && leg.actual_km / route.distance_km > 1.05;
-                        if p95 > dev_threshold && costs_distance {
+                        // Matched legs use the road-true off-route fraction;
+                        // chord legs fall back to the p95 point deviation.
+                        let deviated = match leg.off_route_pct {
+                            Some(pct) => pct > state.cfg.trip_off_route_flag_pct,
+                            None => p95 > dev_threshold,
+                        };
+                        if deviated && costs_distance {
                             osrm_flags.push((
                                 Flag {
                                     flag_type: "route_deviation",
@@ -237,6 +350,7 @@ async fn do_run_scan(
                                         "leg_seq": leg.seq,
                                         "deviation_m": p95.round(),
                                         "threshold_m": dev_threshold.round(),
+                                        "off_route_pct": leg.off_route_pct,
                                     }),
                                 },
                                 Some(leg_pos),
@@ -336,6 +450,8 @@ async fn do_run_scan(
                     }),
                     max_deviation_m: l.max_deviation_m,
                     actual_geometry: &l.actual_geometry,
+                    distance_method: l.distance_method,
+                    off_route_pct: l.off_route_pct,
                     osrm_geometry: &l.osrm_geometry,
                 })
                 .collect();
@@ -398,6 +514,17 @@ async fn do_run_scan(
         }
     }
 
+    // ---- Mileage cross-check (nightly scans only) ----------------------------
+    // Our computed day distance vs ETIT's own day-mileage figure. Gated to
+    // small scans so backfills don't hammer the upstream summary endpoint.
+    if date_strs.len() <= 3 {
+        for day_str in &date_strs {
+            if let Ok(day) = NaiveDate::parse_from_str(day_str, "%Y-%m-%d") {
+                run_mileage_checks(state, day, day_str).await;
+            }
+        }
+    }
+
     // ---- Calibration -----------------------------------------------------------
     match run_calibration(state, run_id, &catalog, today).await {
         Ok(n) => summary.suggestions_made = n,
@@ -421,9 +548,12 @@ async fn assemble_history(
         wanted.insert(d);
     }
     wanted.insert(day);
-    if let Some(d) = day.checked_add_days(Days::new(1)) {
-        if d <= today {
-            wanted.insert(d);
+    // Up to D+3: the 72h return cap means a trip can end days later.
+    for ahead in 1..=3u64 {
+        if let Some(d) = day.checked_add_days(Days::new(ahead)) {
+            if d <= today {
+                wanted.insert(d);
+            }
         }
     }
 
@@ -560,7 +690,7 @@ async fn run_calibration(
     if let Some(apex) = state.apex_db.as_ref() {
         let mut unpinned: Vec<(&'static str, String, Vec<(f64, f64)>)> = Vec::new();
 
-        let mut collect = |kind: &'static str,
+        let collect = |kind: &'static str,
                            service_days: Vec<(String, String, String)>,
                            out: &mut Vec<(&'static str, String, Vec<(f64, f64)>)>| {
             let mut by_name: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
@@ -664,4 +794,63 @@ fn epoch_to_rfc3339(ts: i64) -> String {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+
+/// Compare our track-length for each vehicle-day against ETIT's trip
+/// summary mileage; persisted for the dashboard to spot systematic drift.
+async fn run_mileage_checks(state: &AppState, day: NaiveDate, day_str: &str) {
+    let tz = state.cfg.timezone;
+    let from = crate::domain::time::start_of_day_utc(day, tz);
+    let to = crate::domain::time::end_of_day_utc(day, tz);
+
+    let vehicles = match state.vehicles.list().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "mileage check: vehicle list unavailable");
+            return;
+        }
+    };
+    for v in vehicles {
+        let Ok(Some(hist)) = state.history.get_day(&v.id, day).await else {
+            continue;
+        };
+        let pts: Vec<(f64, f64)> = hist.points.iter().map(|p| (p.lat, p.lng)).collect();
+        if pts.len() < 10 {
+            continue;
+        }
+        let computed_km = super::geo::track_length_km(&pts, 5_000.0);
+        let etit_km = match crate::upstream::history::fetch_trip_summary(
+            &state.client,
+            &v.id,
+            from,
+            to,
+        )
+        .await
+        {
+            Ok(s) => parse_etit_mileage(&s.total_mileage),
+            Err(e) => {
+                tracing::debug!(vehicle = %v.id, error = %e, "ETIT trip summary unavailable");
+                None
+            }
+        };
+        if let Err(e) = state
+            .trip_repo
+            .upsert_mileage_check(&v.id, day_str, etit_km, (computed_km * 10.0).round() / 10.0)
+            .await
+        {
+            tracing::warn!(error = %e, "storing mileage check failed");
+        }
+    }
+}
+
+/// ETIT renders mileage as e.g. "123.4 km" / "123,4" / "123.4" — pull the
+/// leading number out defensively.
+fn parse_etit_mileage(raw: &str) -> Option<f64> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+        .collect();
+    cleaned.replace(',', ".").parse::<f64>().ok().map(|v| (v * 10.0).round() / 10.0)
 }

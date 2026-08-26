@@ -94,6 +94,10 @@ pub struct TripLegRow {
     pub max_deviation_m: Option<f64>,
     pub actual_geometry: String,
     pub osrm_geometry: String,
+    #[sqlx(default)]
+    pub distance_method: String,
+    #[sqlx(default)]
+    pub off_route_pct: Option<f64>,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -180,6 +184,8 @@ pub struct NewLeg<'a> {
     pub max_deviation_m: Option<f64>,
     pub actual_geometry: &'a str,
     pub osrm_geometry: &'a str,
+    pub distance_method: &'a str,
+    pub off_route_pct: Option<f64>,
 }
 
 pub struct NewFlag<'a> {
@@ -296,8 +302,8 @@ impl TripAuditRepo {
                      (match_id, seq, leg_type, from_name, to_name, depart_ts,
                       arrive_ts, night_window, actual_km, osrm_km, actual_secs,
                       osrm_secs, distance_ratio, max_deviation_m,
-                      actual_geometry, osrm_geometry)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
+                      actual_geometry, osrm_geometry, distance_method, off_route_pct)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"#,
             )
             .bind(match_id)
             .bind(leg.seq)
@@ -315,6 +321,8 @@ impl TripAuditRepo {
             .bind(leg.max_deviation_m)
             .bind(leg.actual_geometry)
             .bind(leg.osrm_geometry)
+            .bind(leg.distance_method)
+            .bind(leg.off_route_pct)
             .execute(&mut *tx)
             .await?
             .last_insert_rowid();
@@ -586,6 +594,44 @@ impl TripAuditRepo {
             q = q.bind(v.to_string());
         }
         Ok(q.bind(limit.clamp(1, 20)).fetch_all(&self.pool).await?)
+    }
+
+    /// Local days within the last `days_back` days that still have a trip
+    /// with an open return (return_pending flag) — re-audited nightly.
+    pub async fn days_with_pending_returns(&self, days_back: i64) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT DISTINCT m.day_local
+                 FROM trip_matches m
+                 JOIN trip_flags f ON f.match_id = m.id AND f.flag_type = 'return_pending'
+                WHERE m.day_local >= date('now', ?)"#,
+        )
+        .bind(format!("-{} days", days_back.max(1)))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(d,)| d).collect())
+    }
+
+    pub async fn upsert_mileage_check(
+        &self,
+        vehicle_id: &str,
+        day_local: &str,
+        etit_km: Option<f64>,
+        computed_km: f64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO mileage_checks (vehicle_id, day_local, etit_km, computed_km)
+               VALUES (?,?,?,?)
+               ON CONFLICT(vehicle_id, day_local) DO UPDATE SET
+                  etit_km = excluded.etit_km,
+                  computed_km = excluded.computed_km"#,
+        )
+        .bind(vehicle_id)
+        .bind(day_local)
+        .bind(etit_km)
+        .bind(computed_km)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn mark_suggestion_auto_applied(&self, kind: &str, name: &str) -> Result<()> {

@@ -65,6 +65,9 @@ pub struct MatchOutcome {
     pub start_ts: Option<i64>,
     pub end_ts: Option<i64>,
     pub returned_to_terminal: bool,
+    /// True when no return was found but the 72h cap hasn't passed — the
+    /// trip stays open and nightly scans re-audit it.
+    pub return_pending: bool,
     pub deliveries_expected: i64,
     pub deliveries_visited: i64,
     pub legs: Vec<MatchedLeg>,
@@ -107,6 +110,12 @@ pub struct MatchedLeg {
     pub osrm_geometry: String,
     /// Index into MatchOutcome.flags for flags belonging to this leg.
     pub flag_idx: Vec<usize>,
+    /// Timestamped raw points inside the leg window, for map matching.
+    pub raw_points: Vec<(f64, f64, i64)>,
+    /// 'chord' | 'matched' — how actual_km was computed.
+    pub distance_method: &'static str,
+    /// Fraction of the matched route off the optimal corridor (matched legs).
+    pub off_route_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
