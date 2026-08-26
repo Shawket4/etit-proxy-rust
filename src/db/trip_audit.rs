@@ -361,6 +361,7 @@ impl TripAuditRepo {
         flagged_only: bool,
         unreviewed_only: bool,
         company: Option<&str>,
+        q_search: Option<&str>,
         sort: &str,
         page: i64,
         per_page: i64,
@@ -384,11 +385,26 @@ impl TripAuditRepo {
         if unreviewed_only {
             filter.push_str(" AND m.reviewed_at IS NULL");
         }
+        // Free-text search over the fields a dispatcher actually types:
+        // plate, driver, terminal — mirroring the trips module's `search`.
+        let q_like = q_search
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("%{}%", s.trim()));
+        if q_like.is_some() {
+            filter.push_str(
+                " AND (m.car_no_plate LIKE ? OR m.driver_name LIKE ? OR m.terminal_name LIKE ?)",
+            );
+        }
 
         let count_sql = format!("SELECT COUNT(*){filter}");
         let mut cq = sqlx::query_as::<_, (i64,)>(&count_sql);
         for v in [from_day, to_day, status, company].into_iter().flatten() {
             cq = cq.bind(v.to_string());
+        }
+        if let Some(ref like) = q_like {
+            for _ in 0..3 {
+                cq = cq.bind(like.clone());
+            }
         }
         let (total,) = cq.fetch_one(&self.pool).await?;
 
@@ -411,6 +427,11 @@ impl TripAuditRepo {
         let mut q = sqlx::query_as::<_, TripMatchRow>(&sql);
         for v in [from_day, to_day, status, company].into_iter().flatten() {
             q = q.bind(v.to_string());
+        }
+        if let Some(ref like) = q_like {
+            for _ in 0..3 {
+                q = q.bind(like.clone());
+            }
         }
         let rows = q
             .bind(per_page)

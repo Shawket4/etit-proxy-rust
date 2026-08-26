@@ -24,6 +24,8 @@ pub struct ListMatchesQuery {
     pub flagged: bool,
     #[serde(default)]
     pub unreviewed: bool,
+    /// Free-text search: plate, driver, terminal.
+    pub q: Option<String>,
     /// "severity" (review queue order) or "date" (default).
     pub sort: Option<String>,
     pub page: Option<i64>,
@@ -53,6 +55,7 @@ pub async fn list_matches(
             q.flagged,
             q.unreviewed,
             q.company.as_deref(),
+            q.q.as_deref(),
             q.sort.as_deref().unwrap_or("date"),
             page,
             per_page,
