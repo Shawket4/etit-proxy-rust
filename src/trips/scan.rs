@@ -36,6 +36,11 @@ const TRIP_WINDOW_HEAD_START_SECS: i64 = 4 * 3600;
 const MIN_FLAGGABLE_EXCESS_KM: f64 = 2.0;
 
 pub async fn run_scan(state: AppState, dates: Option<Vec<NaiveDate>>) -> TripScanSummary {
+    // One scan at a time, globally. Late acquirers wait (never skip): a
+    // hook flush queued behind the nightly still runs, just later.
+    let _serial = state.scan_lock.clone();
+    let _guard = _serial.lock().await;
+
     let mut summary = TripScanSummary {
         run_id: 0,
         status: "running".into(),
@@ -1227,13 +1232,22 @@ pub fn spawn_trip_scanner(state: AppState) {
         return;
     }
     tokio::spawn(async move {
+        // Each scan runs in its own task: a panic inside one scan must not
+        // kill this scheduler loop (which would silently end all future
+        // nightly scans until a restart).
+        async fn run_isolated(state: AppState) {
+            match tokio::spawn(run_scan(state, None)).await {
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "trip scan task panicked"),
+            }
+        }
         if state.cfg.trip_scan_on_startup {
-            let _ = run_scan(state.clone(), None).await;
+            run_isolated(state.clone()).await;
         }
         loop {
             let sleep = duration_until_next_local(&state.cfg.trip_scan_time, state.cfg.timezone);
             tokio::time::sleep(sleep).await;
-            let _ = run_scan(state.clone(), None).await;
+            run_isolated(state.clone()).await;
         }
     });
 }

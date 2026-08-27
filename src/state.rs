@@ -39,4 +39,9 @@ pub struct AppState {
     /// Days queued by the FalconGo registration hook, drained by a single
     /// debounced flusher task. `.1` = a flusher is currently scheduled.
     pub pending_rescan: Arc<Mutex<(BTreeSet<chrono::NaiveDate>, bool)>>,
+    /// Serializes scans: nightly, hook-flush, dashboard, and startup scans
+    /// take this before touching anything. On one core, two concurrent
+    /// scans would double ETIT/OSRM load and interleave writes for no gain;
+    /// waiting is always correct because scans are idempotent upserts.
+    pub scan_lock: Arc<tokio::sync::Mutex<()>>,
 }

@@ -156,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
             std::collections::BTreeSet::new(),
             false,
         ))),
+        scan_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // ---- Pollers ----------------------------------------------------------
