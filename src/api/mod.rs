@@ -25,7 +25,11 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     let cors = build_cors(&state);
 
-    // API v1 — stable contract.
+    // API v1 — stable contract, dashboard-JWT gated. The JWT layer is
+    // applied HERE, to v1 only: /admin/* has its own token guard and must
+    // not additionally demand a browser session (FalconGo's rescan hook
+    // authenticates with the token alone), and /healthz + /metrics are
+    // operational surfaces for systemd/monitors.
     let v1 = Router::new()
         .route("/vehicles",                get(handlers::vehicles::list))
         .route("/vehicles/live",           get(handlers::live::list))
@@ -44,7 +48,8 @@ pub fn router(state: AppState) -> Router {
         .route("/trip-audit/runs",              get(handlers::trip_audit::list_runs))
         .route("/trip-audit/scan",              post(handlers::trip_audit::run_scan_now))
         .route("/trip-audit/suggestions",       get(handlers::trip_audit::list_suggestions))
-        .route("/trip-audit/suggestions/:id/ack", post(handlers::trip_audit::ack_suggestion));
+        .route("/trip-audit/suggestions/:id/ack", post(handlers::trip_audit::ack_suggestion))
+        .route_layer(axum::middleware::from_fn(crate::auth::require_admin));
 
     // Admin — gated by token. If admin is disabled, the middleware short-
     // circuits with a 404 so the surface area is invisible.

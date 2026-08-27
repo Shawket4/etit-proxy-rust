@@ -25,7 +25,6 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, Expos
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use etit_proxy::api;
-use etit_proxy::auth::require_admin;
 use etit_proxy::cache::CacheLayer;
 use etit_proxy::config::Config;
 use etit_proxy::db::{open_pool, HistoryRepo, TripAuditRepo, VehiclesRepo, ZonesRepo};
@@ -248,12 +247,11 @@ async fn main() -> anyhow::Result<()> {
     // CORS is the outermost layer so preflight OPTIONS requests are answered
     // before auth runs. Browsers send preflights without credentials, so
     // letting auth see them would cause every preflight to 401.
-    let protected = api::router(state)
-        .route_layer(axum::middleware::from_fn(require_admin));
-
+    // JWT gating now lives inside api::router (v1 routes only) so the
+    // token-guarded /admin/* surface and operational endpoints stand alone.
     let app = axum::Router::new()
         .route("/health", get(|| async { "ok" }))
-        .merge(protected)
+        .merge(api::router(state))
         .layer(cors);
 
     let listener = TcpListener::bind(&cfg.bind_addr)
