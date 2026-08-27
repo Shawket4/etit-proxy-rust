@@ -116,57 +116,28 @@ pub struct RescanResponse {
     pub flush_in_secs: u64,
 }
 
-/// Debounce window for hook-triggered rescans: bulk entry of a month of
-/// trips fires dozens of calls; one scan covers them all.
-const RESCAN_DEBOUNCE_SECS: u64 = 60;
-
-/// Registration hook (admin-token surface): FalconGo calls this whenever a
-/// trip is created/edited/deleted so the affected days get re-audited
-/// within ~a minute instead of waiting for the nightly sweep.
+/// Registration/pin hook (admin-token surface): FalconGo calls this when
+/// trips or location pins change so the affected days get re-audited within
+/// ~a minute instead of waiting for the nightly sweep.
 pub async fn queue_rescan(
     State(s): State<AppState>,
     Json(req): Json<RescanRequest>,
 ) -> AppResult<Json<RescanResponse>> {
     let today = crate::domain::time::today_local(s.cfg.timezone);
     let floor = today - chrono::Days::new(60);
-    let mut queued = 0usize;
-    let mut spawn_flusher = false;
-    {
-        let mut g = s.pending_rescan.lock();
-        for d in req.dates.iter().take(64) {
-            let Ok(nd) = chrono::NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d") else {
-                continue;
-            };
-            // Clamp: no future days, nothing past ETIT's practical horizon.
-            if nd > today || nd < floor {
-                continue;
-            }
-            if g.0.insert(nd) {
-                queued += 1;
-            }
-        }
-        if !g.0.is_empty() && !g.1 {
-            g.1 = true;
-            spawn_flusher = true;
-        }
-    }
-    if spawn_flusher {
-        let st = s.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(RESCAN_DEBOUNCE_SECS)).await;
-            let dates: Vec<chrono::NaiveDate> = {
-                let mut g = st.pending_rescan.lock();
-                g.1 = false;
-                std::mem::take(&mut g.0).into_iter().collect()
-            };
-            if dates.is_empty() {
-                return;
-            }
-            tracing::info!(days = dates.len(), "hook-triggered rescan starting");
-            let _ = crate::trips::scan::run_scan(st, Some(dates)).await;
-        });
-    }
-    Ok(Json(RescanResponse { queued, flush_in_secs: RESCAN_DEBOUNCE_SECS }))
+    let dates: Vec<chrono::NaiveDate> = req
+        .dates
+        .iter()
+        .take(64)
+        .filter_map(|d| chrono::NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").ok())
+        // Clamp: no future days, nothing past ETIT's practical horizon.
+        .filter(|nd| *nd <= today && *nd >= floor)
+        .collect();
+    let queued = crate::trips::scan::queue_rescan_days(&s, dates);
+    Ok(Json(RescanResponse {
+        queued,
+        flush_in_secs: crate::trips::scan::RESCAN_DEBOUNCE_SECS,
+    }))
 }
 
 #[derive(Serialize)]

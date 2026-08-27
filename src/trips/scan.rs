@@ -1217,6 +1217,27 @@ async fn run_calibration(
                 if auto_applied {
                     tracing::info!(kind, name = %name, stops = s.stop_count, "auto-applied GPS pin");
                     state.trip_repo.mark_suggestion_auto_applied(kind, &name).await?;
+                    // The days that were unauditable for lack of this pin can
+                    // now be explained — queue them; the debounced flusher
+                    // waits behind this scan's lock and re-audits after.
+                    let names = vec![name.clone()];
+                    let days = if kind == "terminal" {
+                        apex.load_terminal_service_days(&since, &names).await
+                    } else {
+                        apex.load_dropoff_service_days(&since, &names).await
+                    };
+                    if let Ok(days) = days {
+                        let dates: Vec<chrono::NaiveDate> = days
+                            .iter()
+                            .filter_map(|(_, d, _)| {
+                                chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()
+                            })
+                            .collect();
+                        if !dates.is_empty() {
+                            let n = queue_rescan_days(state, dates);
+                            tracing::info!(kind, name = %name, queued = n, "queued rescan for newly pinned place");
+                        }
+                    }
                 }
                 made += 1;
             }
@@ -1258,6 +1279,47 @@ pub fn spawn_trip_scanner(state: AppState) {
 /// re-audits ONLY the days carrying open returns (typically 0–3; GPS for
 /// hot days is kept fresh by tier C), so each pass costs seconds and the
 /// global scan lock keeps it serialized with every other scan.
+/// Debounce window for queued rescans (registration hook + pin changes).
+pub const RESCAN_DEBOUNCE_SECS: u64 = 60;
+
+/// Enqueue days for a debounced rescan and arm the single flusher if none
+/// is scheduled. Shared by the FalconGo hook endpoint and the auto-apply
+/// path (a freshly applied pin re-audits the days it can now explain).
+/// Returns how many days were newly queued.
+pub fn queue_rescan_days(state: &AppState, dates: Vec<NaiveDate>) -> usize {
+    let mut queued = 0usize;
+    let mut spawn_flusher = false;
+    {
+        let mut g = state.pending_rescan.lock();
+        for d in dates {
+            if g.0.insert(d) {
+                queued += 1;
+            }
+        }
+        if !g.0.is_empty() && !g.1 {
+            g.1 = true;
+            spawn_flusher = true;
+        }
+    }
+    if spawn_flusher {
+        let st = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(RESCAN_DEBOUNCE_SECS)).await;
+            let dates: Vec<NaiveDate> = {
+                let mut g = st.pending_rescan.lock();
+                g.1 = false;
+                std::mem::take(&mut g.0).into_iter().collect()
+            };
+            if dates.is_empty() {
+                return;
+            }
+            tracing::info!(days = dates.len(), "queued rescan starting");
+            let _ = run_scan(st, Some(dates)).await;
+        });
+    }
+    queued
+}
+
 pub fn spawn_pending_return_closer(state: AppState) {
     if state.apex_db.is_none() || state.cfg.trip_pending_closer_secs == 0 {
         return;
