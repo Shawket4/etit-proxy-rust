@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/cache/invalidate", post(handlers::admin::invalidate))
         .route("/auth/relogin",     post(handlers::admin::relogin))
         .route("/users/unblock",    post(handlers::admin::unblock_user))
+        .route("/trip-audit/rescan", post(handlers::trip_audit::queue_rescan))
         .layer(from_fn_with_state(admin_state, middleware::admin_guard));
 
     Router::new()

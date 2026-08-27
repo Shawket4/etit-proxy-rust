@@ -100,6 +100,16 @@ async fn do_run_scan(
             let mut days: Vec<NaiveDate> = (1..=state.cfg.trip_scan_lookback_days.max(1) as u64)
                 .filter_map(|i| today.checked_sub_days(Days::new(i)))
                 .collect();
+            // The last week is always re-swept: GPS is cached, so it is
+            // cheap, and it catches same-week registrations/edits without
+            // any bookkeeping.
+            for i in 2..=7u64 {
+                if let Some(d) = today.checked_sub_days(Days::new(i)) {
+                    if !days.contains(&d) {
+                        days.push(d);
+                    }
+                }
+            }
             // Open trips (return_pending) from recent days get re-audited
             // until their return shows up or the cap passes.
             match state.trip_repo.days_with_pending_returns(4).await {
@@ -115,6 +125,44 @@ async fn do_run_scan(
                 }
                 Err(e) => tracing::warn!(error = %e, "loading pending-return days failed"),
             }
+            // Late registrations: any day in the last 45 whose registered-
+            // trip activity (create/edit/delete) is newer than our audit
+            // rows for that day gets re-audited. Trips are often entered
+            // weeks after the fact — without this they would never be seen.
+            if let Some(apex) = state.apex_db.as_ref() {
+                let since = today
+                    .checked_sub_days(Days::new(45))
+                    .unwrap_or(today)
+                    .format("%Y-%m-%d")
+                    .to_string();
+                let audit_epochs: HashMap<String, i64> = state
+                    .trip_repo
+                    .audit_write_epoch_by_day(&since)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                match apex.trip_activity_by_day(&since).await {
+                    Ok(activity) => {
+                        for (day, act_epoch) in activity {
+                            let Ok(nd) = NaiveDate::parse_from_str(&day, "%Y-%m-%d") else {
+                                continue;
+                            };
+                            if days.contains(&nd) {
+                                continue;
+                            }
+                            // PG timestamps are Cairo local; 3h slack keeps
+                            // borderline days in rather than out.
+                            let audited = audit_epochs.get(&day).copied().unwrap_or(0);
+                            if (act_epoch as i64) - 3 * 3600 > audited {
+                                tracing::info!(day = %day, "re-auditing day with late trip activity");
+                                days.push(nd);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "loading trip activity failed"),
+                }
+            }
             days
         }
     };
@@ -125,6 +173,28 @@ async fn do_run_scan(
 
     let planned = apex.load_planned_trips(&date_strs, &catalog).await?;
     summary.trips_scanned = planned.len() as i64;
+
+    // A re-scanned day owns its audit rows: any row whose parent trip no
+    // longer exists on that day (deleted, or re-dated away) is removed so
+    // the dashboard never shows ghosts.
+    {
+        let mut by_day: HashMap<&str, Vec<i64>> = HashMap::new();
+        for d in &date_strs {
+            by_day.entry(d.as_str()).or_default();
+        }
+        for t in &planned {
+            by_day.entry(t.day_local.as_str()).or_default().push(t.parent_trip_id);
+        }
+        for (day, ids) in by_day {
+            match state.trip_repo.delete_stale_for_day(day, &ids).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(day, removed = n, "removed audit rows for vanished trips")
+                }
+                Err(e) => tracing::warn!(error = %e, day, "stale audit cleanup failed"),
+                _ => {}
+            }
+        }
+    }
     tracing::info!(days = ?date_strs, trips = planned.len(), "trip scan starting");
 
     // ---- Group by vehicle, chronological ---------------------------------------
@@ -746,12 +816,20 @@ async fn do_run_scan(
     // Locations queue never shows ghosts.
     if let Some(apex) = state.apex_db.as_ref() {
         if let Ok(live) = state.trip_repo.live_suggestions().await {
-            for (kind, name, slat, slng) in live {
+            for (kind, name, _slat, _slng, sugg_epoch) in live {
                 match apex.place_pin(&kind, &name).await {
-                    Ok(Some((Some(lat), Some(lng), source)))
+                    // Supersede ONLY on evidence of human action AFTER the
+                    // suggestion was made: the pin is manual AND was edited
+                    // later than the suggestion's last update. A pin that
+                    // merely differs from the suggested point is the normal
+                    // state of a move-pin suggestion; and a manual pin that
+                    // PRE-dates the suggestion is exactly what the
+                    // suggestion is trying to correct. (PG timestamps are
+                    // Cairo local; allow 3h skew slack toward keeping.)
+                    Ok(Some((Some(lat), Some(lng), source, Some(pin_epoch))))
                         if (lat != 0.0 || lng != 0.0)
-                            && (source == "manual"
-                                || haversine_m(lat, lng, slat, slng) > 150.0) =>
+                            && source == "manual"
+                            && (pin_epoch as i64) - 3 * 3600 > sugg_epoch =>
                     {
                         if state
                             .trip_repo
@@ -1026,6 +1104,7 @@ async fn run_calibration(
                 .push((s.lat, s.lng));
         }
     }
+    tracing::debug!(rows = per_vehicle_day.len(), stops = all_stops.len(), "calibration stops loaded");
     if all_stops.is_empty() {
         return Ok(0);
     }
@@ -1104,6 +1183,7 @@ async fn run_calibration(
                     tracing::warn!(error = %e, "loading drop-off service days failed");
                     Vec::new()
                 });
+            tracing::debug!(unpinned = catalog.unpinned_dropoffs.len(), service_days = days.len(), "calibration drop-off service days");
             collect("dropoff", days, &mut unpinned);
         }
         if !catalog.unpinned_terminals.is_empty() {
@@ -1118,6 +1198,7 @@ async fn run_calibration(
         }
 
         for (kind, name, stops) in unpinned {
+            tracing::debug!(kind, name = %name, candidates = stops.len(), "calibration unpinned candidates");
             if let Some(s) = calibrate::suggest_for_unpinned(kind, &name, &stops) {
                 let auto_applied = s.stop_count >= state.cfg.trip_pin_auto_apply_min_stops
                     && apex

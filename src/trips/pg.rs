@@ -226,19 +226,49 @@ impl ApexDb {
         .context("loading drop-off service days")?)
     }
 
-    /// Current pin + provenance for one place, for suggestion reconciliation.
+    /// Days (YYYY-MM-DD) in [since_day, ..] whose registered-trip activity
+    /// (create/update/soft-delete on parent trips or container trips) is
+    /// newer than `floor_epoch` per-day map — used by the nightly sweep to
+    /// re-audit late registrations and edits. Returns (date, activity_epoch).
+    pub async fn trip_activity_by_day(
+        &self,
+        since_day: &str,
+    ) -> Result<Vec<(String, f64)>> {
+        Ok(sqlx::query_as(
+            r#"SELECT pt.date,
+                      CAST(EXTRACT(EPOCH FROM GREATEST(
+                          MAX(COALESCE(pt.updated_at, pt.created_at)),
+                          MAX(COALESCE(pt.deleted_at, pt.created_at)),
+                          MAX(COALESCE(t.updated_at, t.created_at, pt.created_at)),
+                          MAX(COALESCE(t.deleted_at, pt.created_at))
+                      )) AS float8)
+                 FROM parent_trips pt
+                 LEFT JOIN trips t ON t.parent_trip_id = pt.id
+                WHERE pt.date >= $1 AND pt.date != ''
+                GROUP BY pt.date"#,
+        )
+        .bind(since_day)
+        .fetch_all(&self.pool)
+        .await
+        .context("loading trip activity by day")?)
+    }
+
+    /// Current pin + provenance + last-edit epoch for one place, for
+    /// suggestion reconciliation.
     pub async fn place_pin(
         &self,
         kind: &str,
         name: &str,
-    ) -> Result<Option<(Option<f64>, Option<f64>, String)>> {
+    ) -> Result<Option<(Option<f64>, Option<f64>, String, Option<f64>)>> {
         let sql = if kind == "terminal" {
             r#"SELECT CAST(latitude AS float8), CAST(longitude AS float8),
-                      COALESCE(pin_source, '')
+                      COALESCE(pin_source, ''),
+                      CAST(EXTRACT(EPOCH FROM updated_at) AS float8)
                  FROM terminals WHERE name = $1 AND deleted_at IS NULL LIMIT 1"#
         } else {
             r#"SELECT CAST(latitude AS float8), CAST(longitude AS float8),
-                      COALESCE(pin_source, '')
+                      COALESCE(pin_source, ''),
+                      CAST(EXTRACT(EPOCH FROM updated_at) AS float8)
                  FROM drop_off_points WHERE name = $1 AND deleted_at IS NULL LIMIT 1"#
         };
         Ok(sqlx::query_as(sql).bind(name).fetch_optional(&self.pool).await?)

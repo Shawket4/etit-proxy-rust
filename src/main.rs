@@ -152,6 +152,10 @@ async fn main() -> anyhow::Result<()> {
         ),
         broadcaster: broadcaster.clone(),
         started_at:  Instant::now(),
+        pending_rescan: std::sync::Arc::new(parking_lot::Mutex::new((
+            std::collections::BTreeSet::new(),
+            false,
+        ))),
     };
 
     // ---- Pollers ----------------------------------------------------------

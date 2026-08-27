@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         ),
         broadcaster: Broadcaster::new(8),
         started_at: Instant::now(),
+        pending_rescan: std::sync::Arc::new(parking_lot::Mutex::new((
+            std::collections::BTreeSet::new(),
+            false,
+        ))),
     };
 
     let summary =

@@ -3,8 +3,11 @@
 //! Everything in here is wrapped in `Arc` (or is `Clone`-cheap) so the
 //! state can be cloned per-request without copying real data.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
+
+use parking_lot::Mutex;
 
 use crate::cache::CacheLayer;
 use crate::config::Config;
@@ -33,4 +36,7 @@ pub struct AppState {
     pub osrm: OsrmClient,
     pub broadcaster: Arc<Broadcaster>,
     pub started_at: Instant,
+    /// Days queued by the FalconGo registration hook, drained by a single
+    /// debounced flusher task. `.1` = a flusher is currently scheduled.
+    pub pending_rescan: Arc<Mutex<(BTreeSet<chrono::NaiveDate>, bool)>>,
 }

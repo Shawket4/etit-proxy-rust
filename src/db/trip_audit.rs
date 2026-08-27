@@ -669,6 +669,41 @@ impl TripAuditRepo {
         Ok(())
     }
 
+    /// Per-day newest audit write epoch, for the nightly activity sweep.
+    pub async fn audit_write_epoch_by_day(
+        &self,
+        since_day: &str,
+    ) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as(
+            r#"SELECT day_local, CAST(strftime('%s', MAX(created_at)) AS INTEGER)
+                 FROM trip_matches
+                WHERE day_local >= ?
+                GROUP BY day_local"#,
+        )
+        .bind(since_day)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Remove audit rows for parent trips that no longer exist (deleted or
+    /// re-dated) on a day being re-scanned. Legs/flags cascade.
+    pub async fn delete_stale_for_day(&self, day: &str, keep_ids: &[i64]) -> Result<u64> {
+        let placeholders = std::iter::repeat("?")
+            .take(keep_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = if keep_ids.is_empty() {
+            "DELETE FROM trip_matches WHERE day_local = ?".to_string()
+        } else {
+            format!("DELETE FROM trip_matches WHERE day_local = ? AND parent_trip_id NOT IN ({placeholders})")
+        };
+        let mut q = sqlx::query(&sql).bind(day);
+        for id in keep_ids {
+            q = q.bind(id);
+        }
+        Ok(q.execute(&self.pool).await?.rows_affected())
+    }
+
     /// Mark live suggestions superseded when a human has since re-pinned the
     /// place outside the suggestion flow (pin_source no longer gps-derived,
     /// or the pin moved away from the suggested point). Runs each scan so
@@ -688,9 +723,11 @@ impl TripAuditRepo {
     }
 
     /// All suggestions still shown in the queue, for reconciliation.
-    pub async fn live_suggestions(&self) -> Result<Vec<(String, String, f64, f64)>> {
+    /// The last element is the suggestion's updated_at as a unix epoch.
+    pub async fn live_suggestions(&self) -> Result<Vec<(String, String, f64, f64, i64)>> {
         Ok(sqlx::query_as(
-            r#"SELECT kind, name, suggested_lat, suggested_lng
+            r#"SELECT kind, name, suggested_lat, suggested_lng,
+                      CAST(strftime('%s', updated_at) AS INTEGER)
                  FROM location_suggestions
                 WHERE status IN ('pending', 'auto_applied')"#,
         )
