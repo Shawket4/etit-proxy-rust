@@ -1252,6 +1252,43 @@ pub fn spawn_trip_scanner(state: AppState) {
     });
 }
 
+/// Hourly pending-return closer: trucks close their trips by simply driving
+/// home — no database mutation fires the registration hook, so without this
+/// an open trip (return_pending) waits for the nightly scan. This loop
+/// re-audits ONLY the days carrying open returns (typically 0–3; GPS for
+/// hot days is kept fresh by tier C), so each pass costs seconds and the
+/// global scan lock keeps it serialized with every other scan.
+pub fn spawn_pending_return_closer(state: AppState) {
+    if state.apex_db.is_none() || state.cfg.trip_pending_closer_secs == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(state.cfg.trip_pending_closer_secs.max(300));
+        loop {
+            tokio::time::sleep(period).await;
+            let days = match state.trip_repo.days_with_pending_returns(4).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(error = %e, "pending-return closer: day query failed");
+                    continue;
+                }
+            };
+            let dates: Vec<NaiveDate> = days
+                .iter()
+                .filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .collect();
+            if dates.is_empty() {
+                continue;
+            }
+            tracing::info!(days = dates.len(), "pending-return closer: re-auditing open trips");
+            match tokio::spawn(run_scan(state.clone(), Some(dates))).await {
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "pending-return closer task panicked"),
+            }
+        }
+    });
+}
+
 fn duration_until_next_local(time_str: &str, tz: chrono_tz::Tz) -> Duration {
     let now = Utc::now().with_timezone(&tz);
     let target_time = chrono::NaiveTime::parse_from_str(time_str, "%H:%M").unwrap();

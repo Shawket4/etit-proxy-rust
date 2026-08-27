@@ -85,6 +85,10 @@ pub struct Config {
     /// Flag thresholds.
     pub trip_flag_distance_ratio: f64,
     pub trip_flag_duration_ratio: f64,
+    /// Interval for the pending-return closer: re-audits only the days
+    /// carrying return_pending flags so open trips close within ~an hour of
+    /// the truck's actual arrival instead of at the next nightly. 0 = off.
+    pub trip_pending_closer_secs: u64,
     pub trip_unplanned_stop_secs: i64,
     pub trip_deviation_m: f64,
     /// Auto-apply a GPS pin suggestion to an UNPINNED place when its cluster
@@ -198,6 +202,7 @@ impl Config {
         // Trucks run well below OSRM's modeled speeds; 2.5× filters to real
         // outliers instead of flagging every trip.
         let trip_flag_duration_ratio = parse_or("TRIP_FLAG_DURATION_RATIO", 2.5_f64)?;
+        let trip_pending_closer_secs = parse_or("TRIP_PENDING_CLOSER_SECS", 3600_u64)?;
         let trip_unplanned_stop_secs = parse_or("TRIP_UNPLANNED_STOP_SECS", 900)?;
         let trip_deviation_m = parse_or("TRIP_DEVIATION_M", 2000.0_f64)?;
         let trip_pin_auto_apply_min_stops = parse_or("TRIP_PIN_AUTO_APPLY_MIN_STOPS", 5_i64)?;
@@ -262,6 +267,7 @@ impl Config {
             dropoff_radius_m,
             trip_flag_distance_ratio,
             trip_flag_duration_ratio,
+            trip_pending_closer_secs,
             trip_unplanned_stop_secs,
             trip_deviation_m,
             trip_pin_auto_apply_min_stops,

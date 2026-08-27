@@ -174,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- Trip Audit Scanner -------------------------------------------------
     etit_proxy::trips::scan::spawn_trip_scanner(state.clone());
+    etit_proxy::trips::scan::spawn_pending_return_closer(state.clone());
 
     // ---- CORS -------------------------------------------------------------
     //
