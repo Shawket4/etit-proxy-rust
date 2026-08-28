@@ -365,9 +365,11 @@ impl HistoryService {
     }
 }
 
-/// Thin a point list to OSRM's matching budget, preserving order.
+/// Thin a point list for interactive matching, preserving order. 600 points
+/// costs ~0.3% distance accuracy vs a full day's trace but keeps the match
+/// fast even when OSRM has to page its dataset back in.
 fn thin_trace(points: &[crate::domain::history::HistoryPoint]) -> Vec<(f64, f64, i64)> {
-    const MAX_PTS: usize = 1800;
+    const MAX_PTS: usize = 600;
     let timed: Vec<(f64, f64, i64)> = points
         .iter()
         .filter_map(|p| p.timestamp.map(|t| (p.lat, p.lng, t.timestamp())))
