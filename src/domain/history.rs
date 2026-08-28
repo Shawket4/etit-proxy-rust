@@ -51,6 +51,29 @@ pub struct TripSummary {
     pub ignition_on_count: String,
 }
 
+/// A place the vehicle meaningfully dwelled at inside the window — fed from
+/// the trip-audit's matched legs (terminals, drop-offs, garages) and its
+/// unplanned-stop flags, so the live-tracking map pins agree with the audit
+/// by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignificantPin {
+    pub name: String,
+    /// "terminal" | "dropoff" | "garage" | "stop"
+    pub kind: String,
+    pub lat: f64,
+    pub lng: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrive: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depart: Option<Timestamp>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dwell_secs: Option<i64>,
+    /// The registered trip this pin belongs to; None for unplanned stops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_trip_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryResponse {
@@ -63,6 +86,9 @@ pub struct HistoryResponse {
     pub geometry: String,
     pub cached: bool,
     pub fetched_at: Timestamp,
+    /// Audit-derived dwell pins; empty when the audit has no matches here.
+    #[serde(default)]
+    pub pins: Vec<SignificantPin>,
 }
 
 impl HistoryResponse {
@@ -91,6 +117,7 @@ impl HistoryResponse {
             geometry,
             cached,
             fetched_at,
+            pins: Vec::new(),
         }
     }
 }
@@ -124,6 +151,34 @@ pub fn encode_polyline(points: &[HistoryPoint]) -> String {
         last_lng = lng;
     }
     out
+}
+
+/// Decode a precision-5 polyline. Inverse of [`encode_polyline`]; tolerant
+/// of truncated input (returns what it decoded so far).
+pub fn decode_polyline(poly: &str) -> Vec<(f64, f64)> {
+    let bytes = poly.as_bytes();
+    let mut coords = Vec::new();
+    let (mut i, mut lat, mut lng) = (0usize, 0i64, 0i64);
+    while i < bytes.len() {
+        let next = |i: &mut usize| -> Option<i64> {
+            let (mut result, mut shift) = (0i64, 0u32);
+            loop {
+                let b = (*bytes.get(*i)? as i64) - 63;
+                *i += 1;
+                result |= (b & 0x1f) << shift;
+                shift += 5;
+                if b < 0x20 {
+                    break;
+                }
+            }
+            Some(if result & 1 != 0 { !(result >> 1) } else { result >> 1 })
+        };
+        let (Some(dlat), Some(dlng)) = (next(&mut i), next(&mut i)) else { break };
+        lat += dlat;
+        lng += dlng;
+        coords.push((lat as f64 / 1e5, lng as f64 / 1e5));
+    }
+    coords
 }
 
 pub fn simplify_points(

@@ -1,13 +1,122 @@
 //! `/api/v1/vehicles/:id/history` handler.
 
 use axum::extract::{Path, Query, State};
-use axum::Json;
+use axum::response::{IntoResponse, Response};
 use chrono::NaiveDate;
+use serde::Serialize;
 
 use crate::api::dto::HistoryQuery;
-use crate::domain::history::HistoryResponse;
+use crate::domain::history::{decode_polyline, SignificantPin};
+use crate::domain::time::Timestamp;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
+
+/// JSON by default; MessagePack (named maps, the encoding apex-react already
+/// speaks for apex-rust) when the caller asks with `format=msgpack`.
+fn respond<T: Serialize>(payload: &T, msgpack: bool) -> AppResult<Response> {
+    if msgpack {
+        let bytes = rmp_serde::to_vec_named(payload)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("msgpack encode: {e}")))?;
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/msgpack")],
+            bytes,
+        )
+            .into_response())
+    } else {
+        Ok(axum::Json(payload).into_response())
+    }
+}
+
+fn parse_iso(s: &str) -> Option<Timestamp> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Assemble the audit-derived place pins for one vehicle window: the matched
+/// legs give a pin per named place — terminals, drop-offs, garages, nothing
+/// else — with dwell = arrival to the next leg's departure within the same
+/// trip. Coordinates come from the stored leg geometry endpoints, so pins
+/// land exactly where the drawn track does.
+async fn build_pins(
+    s: &AppState,
+    vehicle_id: &str,
+    from: Timestamp,
+    to: Timestamp,
+) -> Vec<SignificantPin> {
+    let from_iso = from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let to_iso = to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let legs = match s.trip_repo.legs_for_vehicle(vehicle_id, &from_iso, &to_iso).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(vehicle_id, error = %e, "pin legs query failed; returning no pins");
+            return Vec::new();
+        }
+    };
+
+    let mut pins: Vec<SignificantPin> = Vec::new();
+    let mut i = 0usize;
+    while i < legs.len() {
+        let leg = &legs[i];
+        let geom = decode_polyline(&leg.actual_geometry);
+
+        // The journey's starting place: pinned once, from the first leg of
+        // each trip, at the geometry's first point.
+        if i == 0 || legs[i - 1].parent_trip_id != leg.parent_trip_id {
+            if let Some(&(lat, lng)) = geom.first() {
+                pins.push(SignificantPin {
+                    name: leg.from_name.clone(),
+                    kind: kind_for(&leg.leg_type, true),
+                    lat,
+                    lng,
+                    arrive: None,
+                    depart: parse_iso(&leg.depart_ts),
+                    dwell_secs: None,
+                    parent_trip_id: Some(leg.parent_trip_id),
+                });
+            }
+        }
+
+        // The arrival place; dwell runs until the same trip's next leg
+        // departs (None = trip ended here or return still pending).
+        if let Some(&(lat, lng)) = geom.last() {
+            let next = legs
+                .get(i + 1)
+                .filter(|n| n.parent_trip_id == leg.parent_trip_id);
+            let arrive = parse_iso(&leg.arrive_ts);
+            let depart = next.and_then(|n| parse_iso(&n.depart_ts));
+            let dwell = match (arrive, depart) {
+                (Some(a), Some(d)) => Some((d - a).num_seconds().max(0)),
+                _ => None,
+            };
+            pins.push(SignificantPin {
+                name: leg.to_name.clone(),
+                kind: kind_for(&leg.leg_type, false),
+                lat,
+                lng,
+                arrive,
+                depart,
+                dwell_secs: dwell,
+                parent_trip_id: Some(leg.parent_trip_id),
+            });
+        }
+        i += 1;
+    }
+
+    pins.sort_by_key(|p| p.arrive.or(p.depart));
+    pins
+}
+
+fn kind_for(leg_type: &str, is_origin: bool) -> String {
+    match (leg_type, is_origin) {
+        // A trip's first departure point is the loading terminal.
+        (_, true) => "terminal".into(),
+        ("return", false) => "terminal".into(),
+        ("garage", false) => "garage".into(),
+        _ => "dropoff".into(),
+    }
+}
 
 /// `GET /api/v1/vehicles/:id/history?date=YYYY-MM-DD`  
 /// `GET /api/v1/vehicles/:id/history?from=...&to=...`
@@ -19,32 +128,40 @@ pub async fn for_vehicle(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<HistoryQuery>,
-) -> AppResult<Json<HistoryResponse>> {
+) -> AppResult<Response> {
     if id.is_empty() {
         return Err(AppError::BadRequest("vehicle id required".into()));
     }
 
     let force = q.refresh.unwrap_or(false);
+    let msgpack = q.format.as_deref() == Some("msgpack");
 
-    match (q.date.as_deref(), q.from.as_deref(), q.to.as_deref()) {
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => Err(AppError::BadRequest(
-            "use either `date` OR `from`+`to`, not both".into(),
-        )),
-        (_, Some(f), Some(t)) => Ok(Json(s.history.for_range(&id, f, t, force).await?)),
-        (_, Some(_), None) | (_, None, Some(_)) => Err(AppError::BadRequest(
-            "`from` and `to` must be provided together".into(),
-        )),
+    let mut resp = match (q.date.as_deref(), q.from.as_deref(), q.to.as_deref()) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "use either `date` OR `from`+`to`, not both".into(),
+            ))
+        }
+        (_, Some(f), Some(t)) => s.history.for_range(&id, f, t, force).await?,
+        (_, Some(_), None) | (_, None, Some(_)) => {
+            return Err(AppError::BadRequest(
+                "`from` and `to` must be provided together".into(),
+            ))
+        }
         (Some(d), _, _) => {
             let date = NaiveDate::parse_from_str(d.trim(), "%Y-%m-%d").map_err(|e| {
                 AppError::BadRequest(format!("invalid `date` (YYYY-MM-DD): {e}"))
             })?;
-            Ok(Json(s.history.for_day(&id, date, force).await?))
+            s.history.for_day(&id, date, force).await?
         }
         (None, None, None) => {
             let today = s.cache.today_local();
-            Ok(Json(s.history.for_day(&id, today, force).await?))
+            s.history.for_day(&id, today, force).await?
         }
-    }
+    };
+
+    resp.pins = build_pins(&s, &id, resp.from, resp.to).await;
+    respond(&resp, msgpack)
 }
 
 /// `GET /api/v1/vehicles/:id/history/summary?from=...&to=...`
@@ -57,7 +174,7 @@ pub async fn summary(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<HistoryQuery>,
-) -> AppResult<Json<crate::domain::summary::ComputedSummary>> {
+) -> AppResult<Response> {
     let (from, to) = match (q.date.as_deref(), q.from.as_deref(), q.to.as_deref()) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
             return Err(AppError::BadRequest(
@@ -85,5 +202,7 @@ pub async fn summary(
     };
 
     let force = q.refresh.unwrap_or(false);
-    Ok(Json(s.history.computed_summary(&id, &from, &to, force).await?))
+    let msgpack = q.format.as_deref() == Some("msgpack");
+    let summary = s.history.computed_summary(&id, &from, &to, force).await?;
+    respond(&summary, msgpack)
 }

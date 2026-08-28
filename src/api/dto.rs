@@ -14,6 +14,8 @@ pub struct HistoryQuery {
     pub to: Option<String>,
     /// If true, bypass cache and force a fresh fetch from upstream.
     pub refresh: Option<bool>,
+    /// "msgpack" for a MessagePack body; anything else (or absent) is JSON.
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

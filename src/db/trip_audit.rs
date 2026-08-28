@@ -127,6 +127,18 @@ pub struct SuggestionRow {
     pub updated_at: String,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+pub struct PinLegRow {
+    pub parent_trip_id: i64,
+    pub seq: i64,
+    pub leg_type: String,
+    pub from_name: String,
+    pub to_name: String,
+    pub depart_ts: String,
+    pub arrive_ts: String,
+    pub actual_geometry: String,
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TripScanRunRow {
     pub id: i64,
@@ -230,6 +242,26 @@ impl TripAuditRepo {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Matched legs for one vehicle overlapping a UTC window — the raw
+    /// material for the history endpoint's significant pins. ISO-8601 UTC
+    /// strings compare lexicographically, so BETWEEN-style bounds work
+    /// directly on the stored text timestamps.
+    pub async fn legs_for_vehicle(
+        &self,
+        vehicle_id: &str,
+        from_iso: &str,
+        to_iso: &str,
+    ) -> Result<Vec<PinLegRow>> {
+        Ok(sqlx::query_as::<_, PinLegRow>(
+            "SELECT m.parent_trip_id, l.seq, l.leg_type, l.from_name, l.to_name,                     l.depart_ts, l.arrive_ts, l.actual_geometry              FROM trip_match_legs l              JOIN trip_matches m ON m.id = l.match_id              WHERE m.vehicle_id = ? AND l.arrive_ts >= ? AND l.depart_ts <= ?              ORDER BY m.parent_trip_id, l.seq",
+        )
+        .bind(vehicle_id)
+        .bind(from_iso)
+        .bind(to_iso)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn list_runs(&self, limit: i64) -> Result<Vec<TripScanRunRow>> {
