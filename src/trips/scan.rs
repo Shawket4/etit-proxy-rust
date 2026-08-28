@@ -239,6 +239,14 @@ async fn do_run_scan(
         let mut day_cache: HashMap<NaiveDate, (Vec<PointTS>, Vec<StopTS>)> = HashMap::new();
         let mut last_end_ts: Option<i64> = None;
 
+        // Departure terminals across ALL of this vehicle's batch trips — a
+        // place can be today's delivery and tomorrow's departure terminal
+        // (reload at the drop-off), so day-scoped collection is not enough.
+        let vehicle_depart_terminals: std::collections::HashSet<String> = trips
+            .iter()
+            .filter_map(|t| t.terminal.as_ref().map(|p| p.name.clone()))
+            .collect();
+
         // Group the vehicle's trips by day: the day's GPS is partitioned into
         // physical journeys ONCE, and each registered trip is assigned at
         // most one journey whose details agree (same terminal, its drop-offs
@@ -280,15 +288,12 @@ async fn do_run_scan(
                 }
             }
 
-            let depart_terminals: std::collections::HashSet<String> = day_trips
-                .iter()
-                .filter_map(|t| t.terminal.as_ref().map(|p| p.name.clone()))
-                .collect();
+            let depart_terminals = &vehicle_depart_terminals;
             let journeys = super::journeys::partition_journeys(
                 &points,
                 &terminals,
                 &day_dropoffs,
-                &depart_terminals,
+                depart_terminals,
                 window_start,
                 window_end,
             );

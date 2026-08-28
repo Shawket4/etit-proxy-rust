@@ -315,6 +315,42 @@ mod tests {
     }
 
     #[test]
+    fn reload_at_dropoff_splits_when_a_later_trip_departs_there() {
+        // Somed→Qena (day 1), reload AT Qena, Qena→Aswan→Somed (day 2).
+        // With Qena in the vehicle-wide departure set, day 1's journey must
+        // END at the Qena reload instead of swallowing the whole voyage.
+        let somed = place("Somed", 29.97, 32.52);
+        let qena_t = place("Qena", 26.178, 32.686);
+        let qena_d = place("Qena", 26.178, 32.686); // dual-role drop-off
+        let aswan = place("Aswan", 24.149, 32.891);
+
+        let points = pts(&[
+            ((29.97, 32.52), 1_000, 4_000),    // load Somed
+            ((26.178, 32.686), 40_000, 45_000), // deliver + reload at Qena
+            ((24.149, 32.891), 80_000, 84_000), // deliver Aswan
+            ((29.97, 32.52), 120_000, 124_000), // home
+        ]);
+
+        let depart = std::collections::HashSet::from([
+            somed.name.clone(),
+            qena_t.name.clone(), // tomorrow's trip departs Qena
+        ]);
+        let journeys = partition_journeys(
+            &points,
+            &[somed.clone(), qena_t.clone()],
+            &[qena_d, aswan],
+            &depart,
+            0,
+            i64::MAX,
+        );
+        assert_eq!(journeys.len(), 2, "{journeys:?}");
+        assert_eq!(journeys[0].terminal_name, "Somed");
+        assert_eq!(journeys[0].end, Some(40_000), "journey 1 ends at the Qena reload");
+        assert_eq!(journeys[1].terminal_name, "Qena");
+        assert_eq!(journeys[1].dropoffs, vec!["Aswan".to_string()]);
+    }
+
+    #[test]
     fn dual_role_place_is_a_delivery_not_a_journey_boundary() {
         // "انابيب البترول بدر" is a terminal in general, but today's trip
         // DELIVERS to it from بدر. Arriving there must not end the journey;
