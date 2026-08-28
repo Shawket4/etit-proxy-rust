@@ -6,7 +6,7 @@ use chrono::NaiveDate;
 use serde::Serialize;
 
 use crate::api::dto::HistoryQuery;
-use crate::domain::history::{decode_polyline, SignificantPin};
+use crate::domain::history::{decode_polyline, HistoryLeg, SignificantPin};
 use crate::domain::time::Timestamp;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -33,27 +33,62 @@ fn parse_iso(s: &str) -> Option<Timestamp> {
         .map(|t| t.with_timezone(&chrono::Utc))
 }
 
-/// Assemble the audit-derived place pins for one vehicle window: the matched
-/// legs give a pin per named place — terminals, drop-offs, garages, nothing
-/// else — with dwell = arrival to the next leg's departure within the same
-/// trip. Coordinates come from the stored leg geometry endpoints, so pins
-/// land exactly where the drawn track does.
-async fn build_pins(
+/// Assemble the audit-derived pins AND legs for one vehicle window from a
+/// single query over the matched legs.
+///
+/// Pins: one per named place — terminals, drop-offs, garages, nothing else —
+/// with dwell = arrival to the next leg's departure within the same trip;
+/// coordinates from the stored leg geometry endpoints so pins land exactly
+/// where the drawn track does.
+///
+/// Legs: time-ranges over the response's own points (no actual geometry —
+/// the frontend slices the loaded track, which also self-clips legs that
+/// cross the window edge; the boundary flags say when that happened).
+async fn build_pins_and_legs(
     s: &AppState,
     vehicle_id: &str,
     from: Timestamp,
     to: Timestamp,
-) -> Vec<SignificantPin> {
+    include_optimal: bool,
+) -> (Vec<SignificantPin>, Vec<HistoryLeg>) {
     let from_iso = from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let to_iso = to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let legs = match s.trip_repo.legs_for_vehicle(vehicle_id, &from_iso, &to_iso).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(vehicle_id, error = %e, "pin legs query failed; returning no pins");
-            return Vec::new();
+            tracing::warn!(vehicle_id, error = %e, "audit legs query failed; returning none");
+            return (Vec::new(), Vec::new());
         }
     };
+
+    let out_legs: Vec<HistoryLeg> = legs
+        .iter()
+        .map(|l| {
+            let depart = parse_iso(&l.depart_ts);
+            let arrive = parse_iso(&l.arrive_ts);
+            HistoryLeg {
+                parent_trip_id: l.parent_trip_id,
+                seq: l.seq,
+                leg_type: l.leg_type.clone(),
+                from_name: l.from_name.clone(),
+                to_name: l.to_name.clone(),
+                depart,
+                arrive,
+                actual_km: l.actual_km,
+                osrm_km: l.osrm_km,
+                actual_secs: l.actual_secs,
+                osrm_secs: l.osrm_secs,
+                distance_ratio: l.distance_ratio,
+                off_route_pct: l.off_route_pct,
+                distance_method: l.distance_method.clone(),
+                starts_before_window: depart.map_or(false, |d| d < from),
+                ends_after_window: arrive.map_or(false, |a| a > to),
+                osrm_geometry: (include_optimal && !l.osrm_geometry.is_empty())
+                    .then(|| l.osrm_geometry.clone()),
+            }
+        })
+        .collect();
 
     let mut pins: Vec<SignificantPin> = Vec::new();
     let mut i = 0usize;
@@ -105,7 +140,7 @@ async fn build_pins(
     }
 
     pins.sort_by_key(|p| p.arrive.or(p.depart));
-    pins
+    (pins, out_legs)
 }
 
 fn kind_for(leg_type: &str, is_origin: bool) -> String {
@@ -160,7 +195,10 @@ pub async fn for_vehicle(
         }
     };
 
-    resp.pins = build_pins(&s, &id, resp.from, resp.to).await;
+    let include_optimal = q.include.as_deref() == Some("optimal");
+    let (pins, legs) = build_pins_and_legs(&s, &id, resp.from, resp.to, include_optimal).await;
+    resp.pins = pins;
+    resp.legs = legs;
     respond(&resp, msgpack)
 }
 

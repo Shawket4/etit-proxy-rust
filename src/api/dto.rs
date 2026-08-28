@@ -16,6 +16,8 @@ pub struct HistoryQuery {
     pub refresh: Option<bool>,
     /// "msgpack" for a MessagePack body; anything else (or absent) is JSON.
     pub format: Option<String>,
+    /// "optimal" attaches each leg's OSRM-optimal polyline.
+    pub include: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

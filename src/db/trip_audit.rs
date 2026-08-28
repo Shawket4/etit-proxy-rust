@@ -137,6 +137,16 @@ pub struct PinLegRow {
     pub depart_ts: String,
     pub arrive_ts: String,
     pub actual_geometry: String,
+    pub actual_km: f64,
+    pub osrm_km: Option<f64>,
+    pub actual_secs: i64,
+    pub osrm_secs: Option<i64>,
+    pub distance_ratio: Option<f64>,
+    #[sqlx(default)]
+    pub off_route_pct: Option<f64>,
+    #[sqlx(default)]
+    pub distance_method: String,
+    pub osrm_geometry: String,
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -255,7 +265,7 @@ impl TripAuditRepo {
         to_iso: &str,
     ) -> Result<Vec<PinLegRow>> {
         Ok(sqlx::query_as::<_, PinLegRow>(
-            "SELECT m.parent_trip_id, l.seq, l.leg_type, l.from_name, l.to_name,                     l.depart_ts, l.arrive_ts, l.actual_geometry              FROM trip_match_legs l              JOIN trip_matches m ON m.id = l.match_id              WHERE m.vehicle_id = ? AND l.arrive_ts >= ? AND l.depart_ts <= ?              ORDER BY m.parent_trip_id, l.seq",
+            "SELECT m.parent_trip_id, l.seq, l.leg_type, l.from_name, l.to_name,                     l.depart_ts, l.arrive_ts, l.actual_geometry, l.actual_km, l.osrm_km, l.actual_secs, l.osrm_secs, l.distance_ratio, l.off_route_pct, l.distance_method, l.osrm_geometry FROM trip_match_legs l              JOIN trip_matches m ON m.id = l.match_id              WHERE m.vehicle_id = ? AND l.arrive_ts >= ? AND l.depart_ts <= ?              ORDER BY m.parent_trip_id, l.seq",
         )
         .bind(vehicle_id)
         .bind(from_iso)

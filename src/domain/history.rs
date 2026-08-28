@@ -74,6 +74,44 @@ pub struct SignificantPin {
     pub parent_trip_id: Option<i64>,
 }
 
+/// One audit leg as a time-range over the already-loaded track. No actual
+/// geometry: the frontend slices the response's own points by
+/// [depart, arrive] — which also self-clips boundary legs to the window.
+/// Optimal geometry ships only when the caller asks (`include=optimal`);
+/// it is the one thing not derivable from the loaded route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryLeg {
+    pub parent_trip_id: i64,
+    pub seq: i64,
+    /// "outbound" | "between" | "return" | "garage"
+    pub leg_type: String,
+    pub from_name: String,
+    pub to_name: String,
+    /// Full-leg truth from the audit — may extend beyond the window.
+    pub depart: Option<Timestamp>,
+    pub arrive: Option<Timestamp>,
+    pub actual_km: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osrm_km: Option<f64>,
+    pub actual_secs: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osrm_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub distance_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub off_route_pct: Option<f64>,
+    pub distance_method: String,
+    /// True when the leg's span crosses the requested window edge — the
+    /// visible slice is partial, and the UI should say so.
+    pub starts_before_window: bool,
+    pub ends_after_window: bool,
+    /// polyline5 of the OSRM-optimal route; present only with
+    /// `include=optimal`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub osrm_geometry: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryResponse {
@@ -89,6 +127,9 @@ pub struct HistoryResponse {
     /// Audit-derived dwell pins; empty when the audit has no matches here.
     #[serde(default)]
     pub pins: Vec<SignificantPin>,
+    /// Audit legs overlapping the window, as time-ranges over `points`.
+    #[serde(default)]
+    pub legs: Vec<HistoryLeg>,
 }
 
 impl HistoryResponse {
@@ -118,6 +159,7 @@ impl HistoryResponse {
             cached,
             fetched_at,
             pins: Vec::new(),
+            legs: Vec::new(),
         }
     }
 }
