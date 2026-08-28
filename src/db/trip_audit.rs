@@ -386,13 +386,16 @@ impl TripAuditRepo {
             filter.push_str(" AND m.reviewed_at IS NULL");
         }
         // Free-text search over the fields a dispatcher actually types:
-        // plate, driver, terminal — mirroring the trips module's `search`.
+        // plate, driver, terminal, and drop-off destinations (leg to_name —
+        // a Qena→Aswan trip must be findable by "Aswan", not just "Qena").
         let q_like = q_search
             .filter(|s| !s.trim().is_empty())
             .map(|s| format!("%{}%", s.trim()));
         if q_like.is_some() {
             filter.push_str(
-                " AND (m.car_no_plate LIKE ? OR m.driver_name LIKE ? OR m.terminal_name LIKE ?)",
+                " AND (m.car_no_plate LIKE ? OR m.driver_name LIKE ? OR m.terminal_name LIKE ? \
+                   OR EXISTS (SELECT 1 FROM trip_match_legs l \
+                              WHERE l.match_id = m.id AND l.to_name LIKE ?))",
             );
         }
 
@@ -402,7 +405,7 @@ impl TripAuditRepo {
             cq = cq.bind(v.to_string());
         }
         if let Some(ref like) = q_like {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 cq = cq.bind(like.clone());
             }
         }
@@ -429,7 +432,7 @@ impl TripAuditRepo {
             q = q.bind(v.to_string());
         }
         if let Some(ref like) = q_like {
-            for _ in 0..3 {
+            for _ in 0..4 {
                 q = q.bind(like.clone());
             }
         }
