@@ -267,9 +267,16 @@ impl HistoryService {
     /// for the same query while ETIT's ingest settles. Nothing here is
     /// persisted: same window in, same numbers out, always derived from the
     /// same cached raw data the map draws.
+    ///
+    /// Distance is the teleport-filtered chord sum over the raw pings —
+    /// deliberately NOT map-matched: measured head-to-head, HMM matching a
+    /// full day costs up to ~30s of OSRM CPU on dense urban traces for a
+    /// ~0.3% distance difference (422.4 raw vs 423.5 matched km on the
+    /// benchmark day), and interactive dashboard traffic doing that starves
+    /// the audit's OSRM. The nightly audit keeps road-snapped precision
+    /// where batch latency is free.
     pub async fn computed_summary(
         &self,
-        osrm: &crate::trips::osrm::OsrmClient,
         vehicle_id: &str,
         from_raw: &str,
         to_raw: &str,
@@ -293,39 +300,8 @@ impl HistoryService {
         let (points, stops, sensors) =
             self.collect_window(vehicle_id, from, to, force_refresh).await?;
 
-        let (mut summary, raw_km) =
+        let (summary, _raw_km) =
             crate::domain::summary::compute_metrics(&points, &stops, &sensors, from, to);
-
-        // Road-snapped distance when the matcher accepts the trace; raw
-        // chord-sum otherwise (same accept policy as the trip audit).
-        if points.len() >= 10 && raw_km > 0.5 {
-            let trace = thin_trace(&points);
-            // Interactive path: an unhealthy OSRM must degrade to the raw
-            // figure in bounded time, not hang the panel for the shared
-            // HTTP client's full timeout.
-            let matched = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                osrm.match_trace(&trace),
-            )
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("map-match exceeded 3s budget")));
-            match matched {
-                Ok(m)
-                    if m.coverage >= 0.85
-                        && m.distance_km / raw_km > 0.7
-                        && m.distance_km / raw_km < 1.6 =>
-                {
-                    summary.mileage_km = crate::domain::summary::round1(m.distance_km);
-                    summary.distance_method = "matched".into();
-                    summary.match_coverage_pct =
-                        Some(crate::domain::summary::round1(m.coverage * 100.0));
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!(vehicle_id, error = %e, "summary map-match failed; using raw distance");
-                }
-            }
-        }
         Ok(summary)
     }
 
@@ -372,31 +348,6 @@ impl HistoryService {
         sensors.retain(|s| s.timestamp >= from && s.timestamp <= to);
         Ok((points, stops, sensors))
     }
-}
-
-/// Thin a point list for interactive matching, preserving order. Collapses
-/// consecutive pings at the same coordinates first (a parked truck emits
-/// hundreds of identical fixes that only slow the matcher down), then caps
-/// at 600 points — ~0.3% distance accuracy vs a full-density trace.
-fn thin_trace(points: &[crate::domain::history::HistoryPoint]) -> Vec<(f64, f64, i64)> {
-    const MAX_PTS: usize = 600;
-    let mut timed: Vec<(f64, f64, i64)> = Vec::with_capacity(points.len());
-    for p in points {
-        let Some(t) = p.timestamp else { continue };
-        if let Some(&(la, ln, _)) = timed.last() {
-            if la == p.lat && ln == p.lng {
-                continue;
-            }
-        }
-        timed.push((p.lat, p.lng, t.timestamp()));
-    }
-    if timed.len() <= MAX_PTS {
-        return timed;
-    }
-    let stride = timed.len() as f64 / MAX_PTS as f64;
-    (0..MAX_PTS)
-        .map(|i| timed[(i as f64 * stride) as usize])
-        .collect()
 }
 
 /// When the nightly healer runs (local time) — before the 04:45 audit scan

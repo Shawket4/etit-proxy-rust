@@ -85,9 +85,5 @@ pub async fn summary(
     };
 
     let force = q.refresh.unwrap_or(false);
-    Ok(Json(
-        s.history
-            .computed_summary(&s.osrm, &id, &from, &to, force)
-            .await?,
-    ))
+    Ok(Json(s.history.computed_summary(&id, &from, &to, force).await?))
 }
