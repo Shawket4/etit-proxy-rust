@@ -59,6 +59,11 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/relogin",     post(handlers::admin::relogin))
         .route("/users/unblock",    post(handlers::admin::unblock_user))
         .route("/trip-audit/rescan", post(handlers::trip_audit::queue_rescan))
+        // Ops-only synchronous scan for explicit days (backfills, dataset
+        // migrations). Unlike /rescan there is no 60-day clamp: it exists
+        // precisely for historical reprocessing, and the token gate is the
+        // authorization boundary.
+        .route("/trip-audit/scan",   post(handlers::trip_audit::run_scan_now))
         .layer(from_fn_with_state(admin_state, middleware::admin_guard));
 
     Router::new()
