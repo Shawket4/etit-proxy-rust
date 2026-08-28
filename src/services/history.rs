@@ -300,7 +300,16 @@ impl HistoryService {
         // chord-sum otherwise (same accept policy as the trip audit).
         if points.len() >= 10 && raw_km > 0.5 {
             let trace = thin_trace(&points);
-            match osrm.match_trace(&trace).await {
+            // Interactive path: an unhealthy OSRM must degrade to the raw
+            // figure in bounded time, not hang the panel for the shared
+            // HTTP client's full timeout.
+            let matched = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                osrm.match_trace(&trace),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("map-match exceeded 3s budget")));
+            match matched {
                 Ok(m)
                     if m.coverage >= 0.85
                         && m.distance_km / raw_km > 0.7
@@ -365,15 +374,22 @@ impl HistoryService {
     }
 }
 
-/// Thin a point list for interactive matching, preserving order. 600 points
-/// costs ~0.3% distance accuracy vs a full day's trace but keeps the match
-/// fast even when OSRM has to page its dataset back in.
+/// Thin a point list for interactive matching, preserving order. Collapses
+/// consecutive pings at the same coordinates first (a parked truck emits
+/// hundreds of identical fixes that only slow the matcher down), then caps
+/// at 600 points — ~0.3% distance accuracy vs a full-density trace.
 fn thin_trace(points: &[crate::domain::history::HistoryPoint]) -> Vec<(f64, f64, i64)> {
     const MAX_PTS: usize = 600;
-    let timed: Vec<(f64, f64, i64)> = points
-        .iter()
-        .filter_map(|p| p.timestamp.map(|t| (p.lat, p.lng, t.timestamp())))
-        .collect();
+    let mut timed: Vec<(f64, f64, i64)> = Vec::with_capacity(points.len());
+    for p in points {
+        let Some(t) = p.timestamp else { continue };
+        if let Some(&(la, ln, _)) = timed.last() {
+            if la == p.lat && ln == p.lng {
+                continue;
+            }
+        }
+        timed.push((p.lat, p.lng, t.timestamp()));
+    }
     if timed.len() <= MAX_PTS {
         return timed;
     }
