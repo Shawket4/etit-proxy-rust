@@ -666,6 +666,45 @@ async fn do_run_scan(
                                     None,
                                 ));
                             }
+
+                            // Composition check: bundling drops on one truck
+                            // should beat separate round trips. When the
+                            // saving is negligible the drops point in
+                            // opposite directions — a dispatch-planning
+                            // signal (info), not a driver fault. Distances
+                            // use the symmetric approximation (t→d doubled).
+                            if n >= 2 {
+                                let split_km: f64 = (1..=n)
+                                    .map(|d| 2.0 * pair.get(&(0, d)).copied().unwrap_or(0.0))
+                                    .sum();
+                                let ret_km = best_order
+                                    .last()
+                                    .and_then(|&l| pair.get(&(0, l)).copied())
+                                    .unwrap_or(0.0);
+                                let bundled_km = best_km + ret_km;
+                                if split_km > 1.0 {
+                                    let savings_pct = 1.0 - bundled_km / split_km;
+                                    if savings_pct < 0.08 {
+                                        let drops: Vec<&str> = deliver_legs
+                                            .iter()
+                                            .map(|(n, _, _, _)| n.as_str())
+                                            .collect();
+                                        osrm_flags.push((
+                                            Flag {
+                                                flag_type: "ineffective_bundling",
+                                                severity: "info",
+                                                details: serde_json::json!({
+                                                    "drops": drops,
+                                                    "bundled_km": (bundled_km * 10.0).round() / 10.0,
+                                                    "split_km": (split_km * 10.0).round() / 10.0,
+                                                    "savings_pct": (savings_pct * 1000.0).round() / 10.0,
+                                                }),
+                                            },
+                                            None,
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
