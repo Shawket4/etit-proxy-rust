@@ -143,7 +143,7 @@ function setup()
     default_mode              = mode.driving,
     default_speed             = 10,
     oneway_handling           = true,
-    side_road_multiplier      = 0.6,  -- penalize side roads more for trucks
+    side_road_multiplier      = 0.4,  -- penalize side roads hard for trucks
     turn_penalty              = 15,   -- trucks take longer to turn
     speed_reduction           = 0.8,
     turn_bias                 = 1.075,
@@ -259,7 +259,7 @@ function setup()
         secondary_link  = 25,
         tertiary        = 45,
         tertiary_link   = 20,
-        unclassified    = 30,
+        unclassified    = 20,
         residential     = 25,
         living_street   = 10,
         service         = 15
@@ -345,11 +345,7 @@ function setup()
     },
 
     tracktype_speeds = {
-      grade1 = 40,
-      grade2 = 25,
-      grade3 = 15,
-      grade4 = 10,
-      grade5 = 5
+      -- Hard-blocked above; kept empty so no side channel re-enables tracks.
     },
 
     smoothness_speeds = {
@@ -436,6 +432,19 @@ function process_way(profile, way, result, relations)
   -- Block hgv=no tagged ways
   local hgv = way:get_value_by_key("hgv")
   if hgv == "no" then
+    return
+  end
+
+  -- A 40t tanker has no business on agricultural tracks, paths, or other
+  -- unpaved farm roads regardless of tags — hard-block them so the optimal
+  -- never routes through fields even when OSM says a track is "drivable".
+  local hw = way:get_value_by_key("highway")
+  if hw == "track" or hw == "path" or hw == "bridleway" or hw == "escape" then
+    return
+  end
+  local surface = way:get_value_by_key("surface")
+  if surface == "dirt" or surface == "sand" or surface == "mud" or surface == "earth"
+      or surface == "grass" or surface == "ground" then
     return
   end
 
