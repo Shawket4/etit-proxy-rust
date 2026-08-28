@@ -498,6 +498,31 @@ function process_way(profile, way, result, relations)
 
   WayHandlers.run(profile, way, result, data, handlers, relations)
 
+  -- Undivided (bidirectional) inter-city roads are slow going for a 40t
+  -- tanker: oncoming traffic, town crossings, speed bumps. Egyptian desert
+  -- highways are mapped as oneway dual-carriageway pairs while Nile-valley
+  -- town roads are not — without this, OSRM routes tankers down the valley
+  -- although the whole fleet (correctly) takes the coast road. Scale both
+  -- speed and rate: routability weighs selection by rate.
+  local ic = way:get_value_by_key("highway")
+  if ic == "trunk" or ic == "primary" or ic == "secondary" then
+    local oneway = way:get_value_by_key("oneway")
+    if oneway ~= "yes" and oneway ~= "1" and oneway ~= "-1" then
+      if result.forward_speed and result.forward_speed > 0 then
+        result.forward_speed = result.forward_speed * 0.6
+      end
+      if result.backward_speed and result.backward_speed > 0 then
+        result.backward_speed = result.backward_speed * 0.6
+      end
+      if result.forward_rate and result.forward_rate > 0 then
+        result.forward_rate = result.forward_rate * 0.6
+      end
+      if result.backward_rate and result.backward_rate > 0 then
+        result.backward_rate = result.backward_rate * 0.6
+      end
+    end
+  end
+
   -- Tag Cairo Ring Road ways with the excludable 'daytimebanned' class
   -- (see comment block above is_daytimebanned_ring_road for the legal basis
   -- and the name-matching limitations).
