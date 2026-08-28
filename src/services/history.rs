@@ -261,12 +261,20 @@ impl HistoryService {
         ))
     }
 
-    pub async fn get_trip_summary(
+    /// Deterministic summary computed from the points/stops/ignition events
+    /// inside the exact requested window — replaces ETIT's asynchronous
+    /// `GetHistoryTripSummary` upstream call, whose numbers keep changing
+    /// for the same query while ETIT's ingest settles. Nothing here is
+    /// persisted: same window in, same numbers out, always derived from the
+    /// same cached raw data the map draws.
+    pub async fn computed_summary(
         &self,
+        osrm: &crate::trips::osrm::OsrmClient,
         vehicle_id: &str,
         from_raw: &str,
         to_raw: &str,
-    ) -> Result<crate::domain::history::TripSummary, AppError> {
+        force_refresh: bool,
+    ) -> Result<crate::domain::summary::ComputedSummary, AppError> {
         if vehicle_id.is_empty() {
             return Err(AppError::BadRequest("vehicle id required".into()));
         }
@@ -275,9 +283,175 @@ impl HistoryService {
             .ok_or_else(|| AppError::BadRequest(format!("invalid `from` datetime: {from_raw}")))?;
         let to = parse_etit_local(to_raw, tz)
             .ok_or_else(|| AppError::BadRequest(format!("invalid `to` datetime: {to_raw}")))?;
+        if to <= from {
+            return Err(AppError::BadRequest("`to` must be after `from`".into()));
+        }
 
-        up::fetch_trip_summary(&self.client, vehicle_id, from, to).await
+        // Unsimplified parts: the map response compresses the polyline,
+        // which is fine for drawing but would distort distance and the
+        // moving/stationary split.
+        let (points, stops, sensors) =
+            self.collect_window(vehicle_id, from, to, force_refresh).await?;
+
+        let (mut summary, raw_km) =
+            crate::domain::summary::compute_metrics(&points, &stops, &sensors, from, to);
+
+        // Road-snapped distance when the matcher accepts the trace; raw
+        // chord-sum otherwise (same accept policy as the trip audit).
+        if points.len() >= 10 && raw_km > 0.5 {
+            let trace = thin_trace(&points);
+            match osrm.match_trace(&trace).await {
+                Ok(m)
+                    if m.coverage >= 0.85
+                        && m.distance_km / raw_km > 0.7
+                        && m.distance_km / raw_km < 1.6 =>
+                {
+                    summary.mileage_km = crate::domain::summary::round1(m.distance_km);
+                    summary.distance_method = "matched".into();
+                    summary.match_coverage_pct =
+                        Some(crate::domain::summary::round1(m.coverage * 100.0));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(vehicle_id, error = %e, "summary map-match failed; using raw distance");
+                }
+            }
+        }
+        Ok(summary)
     }
+
+    /// Day-cache-backed fetch of the raw (unsimplified) parts inside an
+    /// exact window.
+    async fn collect_window(
+        &self,
+        vehicle_id: &str,
+        from: crate::domain::time::Timestamp,
+        to: crate::domain::time::Timestamp,
+        force_refresh: bool,
+    ) -> Result<
+        (
+            Vec<crate::domain::history::HistoryPoint>,
+            Vec<crate::domain::history::Stop>,
+            Vec<crate::domain::history::SensorEvent>,
+        ),
+        AppError,
+    > {
+        let tz = self.cache.tz;
+        let today = self.cache.today_local();
+        let start_date = from.with_timezone(&tz).date_naive();
+        let end_date = to.with_timezone(&tz).date_naive().min(today);
+        if start_date > today {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        let mut points = Vec::new();
+        let mut stops = Vec::new();
+        let mut sensors = Vec::new();
+        let mut curr = start_date;
+        while curr <= end_date {
+            let (day, _) = self.get_or_fetch_day(vehicle_id, curr, force_refresh).await?;
+            points.extend(day.points);
+            stops.extend(day.stops);
+            sensors.extend(day.sensors);
+            match curr.succ_opt() {
+                Some(n) => curr = n,
+                None => break,
+            }
+        }
+        points.retain(|p| p.timestamp.map_or(false, |t| t >= from && t <= to));
+        stops.retain(|s| s.from >= from && s.from <= to);
+        sensors.retain(|s| s.timestamp >= from && s.timestamp <= to);
+        Ok((points, stops, sensors))
+    }
+}
+
+/// Thin a point list to OSRM's matching budget, preserving order.
+fn thin_trace(points: &[crate::domain::history::HistoryPoint]) -> Vec<(f64, f64, i64)> {
+    const MAX_PTS: usize = 1800;
+    let timed: Vec<(f64, f64, i64)> = points
+        .iter()
+        .filter_map(|p| p.timestamp.map(|t| (p.lat, p.lng, t.timestamp())))
+        .collect();
+    if timed.len() <= MAX_PTS {
+        return timed;
+    }
+    let stride = timed.len() as f64 / MAX_PTS as f64;
+    (0..MAX_PTS)
+        .map(|i| timed[(i as f64 * stride) as usize])
+        .collect()
+}
+
+/// When the nightly healer runs (local time) — before the 04:45 audit scan
+/// so healed days are re-audited the same night.
+const HEAL_TIME: &str = "03:10";
+/// How far back it re-fetches.
+const HEAL_DAYS: u64 = 7;
+
+/// Nightly late-data healer: trackers buffering through dead zones upload a
+/// day's GPS hours or days late, and ETIT keeps settling recent history —
+/// the same instability that made its summary endpoint unreliable. Force-
+/// refetch the last N days per vehicle (the safety latch in
+/// `get_or_fetch_day` refuses empty overwrites), and queue a trip-audit
+/// rescan for any day whose point count changed.
+pub fn spawn_history_healer(state: crate::state::AppState) {
+    tokio::spawn(async move {
+        loop {
+            let sleep =
+                crate::trips::scan::duration_until_next_local(HEAL_TIME, state.cfg.timezone);
+            tokio::time::sleep(sleep).await;
+            let st = state.clone();
+            // Panic isolation: a bad day must not kill the scheduler loop.
+            if let Err(e) = tokio::spawn(async move { heal_recent_history(st).await }).await {
+                tracing::error!(error = %e, "history healer panicked");
+            }
+        }
+    });
+}
+
+async fn heal_recent_history(state: crate::state::AppState) {
+    let vehicles = match state.vehicles.list().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "history healer: vehicle list unavailable");
+            return;
+        }
+    };
+    let today = state.cache.today_local();
+    let mut changed_days = std::collections::BTreeSet::new();
+    let mut refreshed = 0usize;
+    for v in vehicles.iter() {
+        for back in 1..=HEAL_DAYS {
+            let Some(day) = today.checked_sub_days(chrono::Days::new(back)) else {
+                continue;
+            };
+            let before = match state.history.repo.get(&v.id, day).await {
+                Ok(r) => r.map(|c| c.points.len()).unwrap_or(0),
+                Err(_) => 0,
+            };
+            match state.history.get_or_fetch_day(&v.id, day, true).await {
+                Ok((after, _)) => {
+                    refreshed += 1;
+                    if after.points.len() != before {
+                        tracing::info!(
+                            vehicle = %v.id, %day, before, after = after.points.len(),
+                            "history healed: point count changed"
+                        );
+                        changed_days.insert(day);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(vehicle = %v.id, %day, error = %e, "history heal fetch failed")
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+    }
+    if !changed_days.is_empty() {
+        let queued =
+            crate::trips::scan::queue_rescan_days(&state, changed_days.iter().cloned().collect());
+        tracing::info!(queued, "history healer queued audit rescans");
+    }
+    tracing::info!(refreshed, changed = changed_days.len(), "history heal pass complete");
 }
 
 fn internal(e: anyhow::Error) -> AppError {

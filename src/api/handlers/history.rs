@@ -48,11 +48,16 @@ pub async fn for_vehicle(
 }
 
 /// `GET /api/v1/vehicles/:id/history/summary?from=...&to=...`
+///
+/// Computed locally from the cached GPS points/stops/ignition events inside
+/// the exact window — never from ETIT's summary endpoint, whose numbers keep
+/// shifting for the same query while their ingest settles. Fully dynamic:
+/// nothing is stored, any window shape works.
 pub async fn summary(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<HistoryQuery>,
-) -> AppResult<Json<crate::domain::history::TripSummary>> {
+) -> AppResult<Json<crate::domain::summary::ComputedSummary>> {
     let (from, to) = match (q.date.as_deref(), q.from.as_deref(), q.to.as_deref()) {
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
             return Err(AppError::BadRequest(
@@ -79,5 +84,10 @@ pub async fn summary(
         }
     };
 
-    Ok(Json(s.history.get_trip_summary(&id, &from, &to).await?))
+    let force = q.refresh.unwrap_or(false);
+    Ok(Json(
+        s.history
+            .computed_summary(&s.osrm, &id, &from, &to, force)
+            .await?,
+    ))
 }

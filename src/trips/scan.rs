@@ -1395,7 +1395,7 @@ pub fn spawn_pending_return_closer(state: AppState) {
     });
 }
 
-fn duration_until_next_local(time_str: &str, tz: chrono_tz::Tz) -> Duration {
+pub(crate) fn duration_until_next_local(time_str: &str, tz: chrono_tz::Tz) -> Duration {
     let now = Utc::now().with_timezone(&tz);
     let target_time = chrono::NaiveTime::parse_from_str(time_str, "%H:%M").unwrap();
     let mut target = tz

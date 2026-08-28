@@ -176,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
     etit_proxy::trips::scan::spawn_trip_scanner(state.clone());
     etit_proxy::trips::scan::spawn_pending_return_closer(state.clone());
 
+    // ---- History late-data healer ------------------------------------------
+    etit_proxy::services::history::spawn_history_healer(state.clone());
+
     // ---- CORS -------------------------------------------------------------
     //
     // `withCredentials: true` on the browser side requires three things from

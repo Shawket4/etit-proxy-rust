@@ -6,6 +6,7 @@
 
 pub mod history;
 pub mod live;
+pub mod summary;
 pub mod time;
 pub mod vehicle;
 
