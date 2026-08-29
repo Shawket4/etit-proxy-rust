@@ -185,9 +185,11 @@ standard admin JWT like the rest of `/api/v1`.
 ### 5.1 `GET /trip-audit/matches?from=&to=&status=&company=&flagged=`
 One row per audited parent trip. `status` ∈ `matched|partial|unmatched`;
 `flagged=true` keeps only trips with at least one flag. Returns
+`flag_count`, totals (`actual_km`, `osrm_km`, `expected_km`,
 `distance_ratio`, `duration_ratio`), and review state.
 
 ### 5.2 `GET /trip-audit/matches/:id`
+Match + `legs[]` (per-leg actual vs OSRM, `actual_geometry`/`osrm_geometry`
 polyline5, `max_deviation_m`, `night_window`) + `flags[]`
 (`excess_distance|excess_duration|unplanned_stop|route_deviation|`
 `skipped_delivery|no_return_data|no_terminal_departure`, `details_json`).
