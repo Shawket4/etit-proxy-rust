@@ -49,7 +49,6 @@ async fn build_pins_and_legs(
     vehicle_id: &str,
     from: Timestamp,
     to: Timestamp,
-    include_optimal: bool,
 ) -> (Vec<SignificantPin>, Vec<HistoryLeg>) {
     let from_iso = from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let to_iso = to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -76,16 +75,10 @@ async fn build_pins_and_legs(
                 depart,
                 arrive,
                 actual_km: l.actual_km,
-                osrm_km: l.osrm_km,
                 actual_secs: l.actual_secs,
-                osrm_secs: l.osrm_secs,
-                distance_ratio: l.distance_ratio,
-                off_route_pct: l.off_route_pct,
                 distance_method: l.distance_method.clone(),
                 starts_before_window: depart.map_or(false, |d| d < from),
                 ends_after_window: arrive.map_or(false, |a| a > to),
-                osrm_geometry: (include_optimal && !l.osrm_geometry.is_empty())
-                    .then(|| l.osrm_geometry.clone()),
             }
         })
         .collect();
@@ -195,8 +188,7 @@ pub async fn for_vehicle(
         }
     };
 
-    let include_optimal = q.include.as_deref() == Some("optimal");
-    let (pins, legs) = build_pins_and_legs(&s, &id, resp.from, resp.to, include_optimal).await;
+    let (pins, legs) = build_pins_and_legs(&s, &id, resp.from, resp.to).await;
     resp.pins = pins;
     resp.legs = legs;
     respond(&resp, msgpack)

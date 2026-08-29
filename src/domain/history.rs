@@ -92,24 +92,12 @@ pub struct HistoryLeg {
     pub depart: Option<Timestamp>,
     pub arrive: Option<Timestamp>,
     pub actual_km: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub osrm_km: Option<f64>,
     pub actual_secs: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub osrm_secs: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub distance_ratio: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub off_route_pct: Option<f64>,
     pub distance_method: String,
     /// True when the leg's span crosses the requested window edge — the
     /// visible slice is partial, and the UI should say so.
     pub starts_before_window: bool,
     pub ends_after_window: bool,
-    /// polyline5 of the OSRM-optimal route; present only with
-    /// `include=optimal`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub osrm_geometry: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
