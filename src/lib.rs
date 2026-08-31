@@ -22,6 +22,7 @@ pub mod domain;
 pub mod error;
 pub mod pollers;
 pub mod services;
+pub mod observability;
 pub mod state;
 pub mod upstream;
 pub mod auth;

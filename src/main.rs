@@ -48,6 +48,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env().context("loading configuration")?;
     install_tracing(cfg.log_format_json);
 
+    // Sentry, if SENTRY_DSN is set. The guard must outlive the server; with no
+    // DSN this is None and the service runs exactly as it did before.
+    let _sentry = etit_proxy::observability::init();
+
     tracing::info!(
         bind      = %cfg.bind_addr,
         data_url  = %cfg.etit_data_url,
@@ -256,7 +260,12 @@ async fn main() -> anyhow::Result<()> {
     let app = axum::Router::new()
         .route("/health", get(|| async { "ok" }))
         .merge(api::router(state))
-        .layer(cors);
+        .layer(cors)
+        // One hub per request, so a captured error carries only its own
+        // request's context and never bleeds scope between concurrent
+        // requests. Everything it attaches is scrubbed in `observability`
+        // before it leaves the process.
+        .layer(sentry_tower::NewSentryLayer::new_from_top());
 
     let listener = TcpListener::bind(&cfg.bind_addr)
         .await
