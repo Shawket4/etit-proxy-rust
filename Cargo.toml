@@ -64,6 +64,7 @@ dotenvy = "0.15"
 jsonwebtoken = "9"
 sentry = "0.49"
 sentry-tower = { version = "0.49", features = ["http"] }
+sentry-tracing = "0.49"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["test-util", "macros", "rt-multi-thread"] }

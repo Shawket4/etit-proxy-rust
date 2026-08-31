@@ -290,7 +290,20 @@ fn install_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,etit_proxy=debug,tower_http=info"));
 
-    let registry = tracing_subscriber::registry().with(filter);
+    // The Sentry layer turns tracing into diagnostics: sqlx emits a span per
+    // query with its elapsed time, so when a 500 fires the event carries the
+    // last queries this request ran and how long each took. That answers most
+    // of "why was this slow" and "what did it just run" without a profiler.
+    //
+    // It carries its own filter rather than sharing the console's. The console
+    // stays at whatever RUST_LOG says; Sentry needs sqlx at debug to see the
+    // queries at all, and putting that on the console would drown it.
+    let sentry_layer = sentry_tracing::layer().with_filter(
+        EnvFilter::try_from_env("SENTRY_TRACING_FILTER")
+            .unwrap_or_else(|_| EnvFilter::new("info,sqlx=debug,etit_proxy=debug")),
+    );
+
+    let registry = tracing_subscriber::registry().with(sentry_layer).with(filter);
     if json {
         registry.with(fmt::layer().json().with_target(false)).init();
     } else {

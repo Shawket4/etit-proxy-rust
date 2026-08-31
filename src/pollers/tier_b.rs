@@ -23,7 +23,17 @@ pub async fn run(p: Arc<Pollers>) {
                 p.broadcaster.publish(LiveEvent::Update(snap));
                 tracing::debug!(count, "tier B refreshed");
             }
-            Err(e) => tracing::warn!(error = %e, "tier B refresh failed"),
+            Err(e) => {
+                // Report, don't just log. A background refresh failing IS the
+                // upstream being down, and it is the only place we would see an
+                // ETIT outage — no request is in flight to carry it. A warn
+                // becomes a breadcrumb and raises no issue, so the whole outage
+                // would have been silent.
+                tracing::warn!(error = %e, "poller.tier_b refresh failed");
+                crate::observability::capture_upstream_failure(
+                    "etit", "poller.tier_b", None, &e,
+                );
+            }
         }
     }
 }
