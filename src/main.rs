@@ -265,7 +265,11 @@ async fn main() -> anyhow::Result<()> {
         // request's context and never bleeds scope between concurrent
         // requests. Everything it attaches is scrubbed in `observability`
         // before it leaves the process.
-        .layer(sentry_tower::NewSentryLayer::new_from_top());
+        .layer(sentry_tower::NewSentryLayer::new_from_top())
+        // Transactions, so upstream latency and throughput are visible and not
+        // only outright failures. NewSentryLayer alone binds a hub and captures
+        // nothing; the capture itself lives in AppError::into_response.
+        .layer(sentry_tower::SentryHttpLayer::with_transaction());
 
     let listener = TcpListener::bind(&cfg.bind_addr)
         .await

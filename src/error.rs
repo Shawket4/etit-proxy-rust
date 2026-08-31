@@ -65,6 +65,32 @@ impl IntoResponse for AppError {
         // Always log internally with the full chain.
         tracing::error!(error = %self, code, "request failed");
 
+        // Report server faults. This is the one funnel every error response
+        // passes through, so capturing here covers the whole surface — the
+        // tower layer only binds a hub, it does not capture anything itself.
+        //
+        // 4xx is skipped: a caller sending a bad request is not a fault here.
+        if status.is_server_error() {
+            match &self {
+                // The body of an upstream response is where the upstream's own
+                // data lives, and it is embedded in this variant's Display.
+                // The scrubber redacts by KEY and cannot clean a message, so
+                // this one is reported by shape only — never by Display.
+                AppError::UpstreamStatus { status: upstream, .. } => {
+                    crate::observability::capture_upstream_status("etit", "http", *upstream);
+                }
+                AppError::Upstream(e) => {
+                    crate::observability::capture_upstream_failure("etit", "transport", None, e);
+                }
+                AppError::SessionDead => {
+                    crate::observability::capture_upstream_status("etit", "session", 401);
+                }
+                other => {
+                    sentry::capture_error(other);
+                }
+            }
+        }
+
         // Public message: opaque for internal errors, otherwise the message.
         let public = match &self {
             AppError::Db(_) | AppError::Internal(_) => "internal server error".to_string(),
