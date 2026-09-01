@@ -230,6 +230,11 @@ async fn main() -> anyhow::Result<()> {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("accept"),
             HeaderName::from_static("x-request-id"),
+            // The caller's trace id. Neither is CORS-safelisted, so without
+            // them the browser strips them at preflight and every request
+            // looks like the start of a new trace.
+            HeaderName::from_static("sentry-trace"),
+            HeaderName::from_static("baggage"),
         ]))
         // Expose response headers that frontend JS needs to read.
         .expose_headers(ExposeHeaders::list([

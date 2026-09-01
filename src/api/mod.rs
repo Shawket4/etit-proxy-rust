@@ -122,5 +122,9 @@ fn build_cors(state: &AppState) -> CorsLayer {
             header::CONTENT_TYPE,
             header::ACCEPT,
             HeaderName::from_str("x-admin-token").unwrap(),
+            // The caller's trace id; not CORS-safelisted, so it must be listed
+            // or the browser strips it at preflight.
+            HeaderName::from_str("sentry-trace").unwrap(),
+            HeaderName::from_str("baggage").unwrap(),
         ])
 }
