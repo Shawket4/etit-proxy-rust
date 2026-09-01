@@ -269,7 +269,7 @@ async fn main() -> anyhow::Result<()> {
         // Transactions, so upstream latency and throughput are visible and not
         // only outright failures. NewSentryLayer alone binds a hub and captures
         // nothing; the capture itself lives in AppError::into_response.
-        .layer(sentry_tower::SentryHttpLayer::with_transaction());
+        .layer(sentry_tower::SentryHttpLayer::new().enable_transaction());
 
     let listener = TcpListener::bind(&cfg.bind_addr)
         .await

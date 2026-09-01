@@ -47,6 +47,10 @@ pub async fn run_scan(state: AppState) -> ScanSummary {
 }
 
 async fn do_run_scan(state: &AppState, summary: &mut ScanSummary) -> anyhow::Result<()> {
+    // Failed alerts are warned on individually, and a warn is a breadcrumb, so
+    // on its own it raises nothing. Counted here so the scan can say once that
+    // it delivered none of them, which is the alerting path being down.
+    let mut alerts_failed: u32 = 0;
     // 2. Load active zones
     let zones = state.zones_repo.list(true).await?;
     if zones.is_empty() {
@@ -109,9 +113,19 @@ async fn do_run_scan(state: &AppState, summary: &mut ScanSummary) -> anyhow::Res
                 summary.alerts_sent += 1;
             }
             Err(e) => {
+                // Counted, not reported one by one: if WhatsApp is down every
+                // alert in the scan fails, and N events would say the same
+                // thing N times. The round reports itself below.
+                alerts_failed += 1;
                 tracing::warn!(error = %e, visit_id = u.id, "Failed to send whatsapp alert");
             }
         }
+    }
+
+    if alerts_failed > 0 && summary.alerts_sent == 0 {
+        crate::observability::capture_batch_failure(
+            "zones.whatsapp_alert", alerts_failed as usize, alerts_failed as usize,
+        );
     }
 
     Ok(())
