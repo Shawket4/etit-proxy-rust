@@ -266,15 +266,30 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "ok" }))
         .merge(api::router(state))
         .layer(cors)
+        // ORDER IS LOAD-BEARING, and it is the reverse of what it reads like.
+        //
+        // axum applies layers in the opposite order to tower's ServiceBuilder:
+        // the LAST .layer() is the OUTERMOST. NewSentryLayer must be outermost
+        // so it binds the per-request hub before SentryHttpLayer configures a
+        // scope, so it goes last.
+        //
+        // With these two the other way round, SentryHttpLayer ran first and
+        // called configure_scope on whatever hub was current -- the main one --
+        // where it installed an event processor stamping that request onto
+        // every event. The processor is never removed, so the process
+        // accumulated one per request forever: a slow leak, and the reason a
+        // background history parse error arrived tagged with the URL of an
+        // unrelated live-vehicles request (APEX-3).
+        //
+        // Transactions, so upstream latency and throughput are visible and not
+        // only outright failures. NewSentryLayer alone binds a hub and captures
+        // nothing; the capture itself lives in AppError::into_response.
+        .layer(sentry_tower::SentryHttpLayer::new().enable_transaction())
         // One hub per request, so a captured error carries only its own
         // request's context and never bleeds scope between concurrent
         // requests. Everything it attaches is scrubbed in `observability`
         // before it leaves the process.
-        .layer(sentry_tower::NewSentryLayer::new_from_top())
-        // Transactions, so upstream latency and throughput are visible and not
-        // only outright failures. NewSentryLayer alone binds a hub and captures
-        // nothing; the capture itself lives in AppError::into_response.
-        .layer(sentry_tower::SentryHttpLayer::new().enable_transaction());
+        .layer(sentry_tower::NewSentryLayer::new_from_top());
 
     let listener = TcpListener::bind(&cfg.bind_addr)
         .await

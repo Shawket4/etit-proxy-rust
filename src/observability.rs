@@ -82,8 +82,27 @@ fn normalise(key: &str) -> String {
         .collect()
 }
 
+/// Keys that match a denylist entry but are not personal.
+///
+/// `name` has to stay a fragment — it is what catches driver_name, first_name
+/// and the rest — but it also matches the SDK's own metadata and the tags this
+/// module sets itself. APEX-7 arrived from the Go service with job.name,
+/// os.name and runtime.name all redacted, so the event could not say which job
+/// had failed.
+///
+/// Exact matches only, and only for keys whose value is a machine's word for
+/// itself. `device.name` is deliberately absent — that one is "Shawket's
+/// iPhone".
+const ALLOW_EXACT: &[&str] = &[
+    "jobname", "osname", "runtimename", "browsername", "sdkname",
+    "servicename", "rustname", "gonamespace",
+];
+
 fn is_sensitive(key: &str) -> bool {
     let k = normalise(key);
+    if ALLOW_EXACT.contains(&k.as_str()) {
+        return false;
+    }
     REDACT_EXACT.contains(&k.as_str()) || REDACT_FRAGMENTS.iter().any(|f| k.contains(f))
 }
 
@@ -477,6 +496,23 @@ pub fn init() -> Option<ClientInitGuard> {
 
 #[cfg(test)]
 mod tests {
+    /// APEX-7 arrived with job.name redacted, so the event could not say which
+    /// job had failed. The scrubber had eaten the tag that made it actionable.
+    #[test]
+    fn machine_metadata_keys_survive() {
+        for key in ["job.name", "os.name", "runtime.name", "browser.name", "sdk.name"] {
+            assert!(!is_sensitive(key), "{key} names a machine, not a person");
+        }
+    }
+
+    /// And the half that must keep working.
+    #[test]
+    fn person_name_keys_are_still_redacted() {
+        for key in ["driver_name", "first_name", "full_name", "device.name", "filename"] {
+            assert!(is_sensitive(key), "{key} must be redacted");
+        }
+    }
+
     #[test]
     fn sanitize_redacts_credentials_and_people() {
         let cases = [
