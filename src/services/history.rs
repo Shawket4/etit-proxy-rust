@@ -363,7 +363,7 @@ const HEAL_DAYS: u64 = 7;
 /// `get_or_fetch_day` refuses empty overwrites), and queue a trip-audit
 /// rescan for any day whose point count changed.
 pub fn spawn_history_healer(state: crate::state::AppState) {
-    tokio::spawn(async move {
+    crate::observability::spawn_isolated(async move {
         loop {
             let sleep =
                 crate::trips::scan::duration_until_next_local(HEAL_TIME, state.cfg.timezone);

@@ -135,9 +135,18 @@ pub async fn fetch_range(
         Err(_) => {
             let fixed = fix_unquoted_json_keys(trimmed);
             serde_json::from_str(&fixed).map_err(|e| {
+                // The shape of the body, never the body. This is an error, so
+                // sentry-tracing turns it into an event and every field on it
+                // is exported; the payload is a day of GPS history, which is
+                // the coordinates the scrubber exists to keep out. Length plus
+                // "did ETIT hand us an HTML error page instead" is what
+                // actually diagnoses this, and serde already says where it
+                // broke. Compliance control -- do not put the body back.
                 tracing::error!(
                     vehicle_id,
-                    body = %truncate_for_log(&fixed, 400),
+                    body_len = fixed.len(),
+                    looks_like_html = fixed.trim_start().starts_with('<'),
+                    error = %e,
                     "history JSON parse failed even after fix"
                 );
                 AppError::Parse(format!("history JSON: {e}"))
@@ -297,9 +306,12 @@ pub async fn fetch_trip_summary(
     let fixed = fix_unquoted_json_keys(&wrapped);
 
     let envelope: TripSummaryEnvelope = serde_json::from_str(&fixed).map_err(|e| {
+        // Shape only -- see the note on the history parse above.
         tracing::error!(
             vehicle_id,
-            body = %truncate_for_log(&fixed, 400),
+            body_len = fixed.len(),
+            looks_like_html = fixed.trim_start().starts_with('<'),
+            error = %e,
             "trip summary JSON parse failed"
         );
         AppError::Parse(format!("summary JSON: {e}"))

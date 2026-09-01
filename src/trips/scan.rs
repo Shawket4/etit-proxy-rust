@@ -1296,7 +1296,7 @@ pub fn spawn_trip_scanner(state: AppState) {
         tracing::info!("APEX_DATABASE_URL not set; trip-audit scanner not started");
         return;
     }
-    tokio::spawn(async move {
+    crate::observability::spawn_isolated(async move {
         // Each scan runs in its own task: a panic inside one scan must not
         // kill this scheduler loop (which would silently end all future
         // nightly scans until a restart).
@@ -1347,7 +1347,7 @@ pub fn queue_rescan_days(state: &AppState, dates: Vec<NaiveDate>) -> usize {
     }
     if spawn_flusher {
         let st = state.clone();
-        tokio::spawn(async move {
+        crate::observability::spawn_isolated(async move {
             tokio::time::sleep(std::time::Duration::from_secs(RESCAN_DEBOUNCE_SECS)).await;
             let dates: Vec<NaiveDate> = {
                 let mut g = st.pending_rescan.lock();
@@ -1368,7 +1368,7 @@ pub fn spawn_pending_return_closer(state: AppState) {
     if state.apex_db.is_none() || state.cfg.trip_pending_closer_secs == 0 {
         return;
     }
-    tokio::spawn(async move {
+    crate::observability::spawn_isolated(async move {
         let period = std::time::Duration::from_secs(state.cfg.trip_pending_closer_secs.max(300));
         loop {
             tokio::time::sleep(period).await;

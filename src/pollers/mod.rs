@@ -39,15 +39,15 @@ impl Pollers {
     pub fn spawn_all(self: Arc<Self>) {
         {
             let p = self.clone();
-            tokio::spawn(async move { tier_a::run(p).await; });
+            crate::observability::spawn_isolated(async move { tier_a::run(p).await; });
         }
         {
             let p = self.clone();
-            tokio::spawn(async move { tier_b::run(p).await; });
+            crate::observability::spawn_isolated(async move { tier_b::run(p).await; });
         }
         {
             let p = self.clone();
-            tokio::spawn(async move { tier_c::run(p).await; });
+            crate::observability::spawn_isolated(async move { tier_c::run(p).await; });
         }
     }
 }

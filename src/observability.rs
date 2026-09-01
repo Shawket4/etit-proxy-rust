@@ -43,6 +43,13 @@ const REDACT_FRAGMENTS: &[&str] = &[
     "longitude",
     "national",
     "ssn",
+    // Payload-bearing field names. An upstream body is not ours to export and
+    // cannot be cleaned once it is a string, so the value is dropped wherever
+    // one of these names appears.
+    "body",
+    "payload",
+    "response_text",
+    "html",
 ];
 
 /// Keys that are personal in full but too short to match as substrings —
@@ -291,6 +298,28 @@ pub fn capture_opaque_failure(service: &str, operation: &str) {
     );
 }
 
+/// Spawn a long-lived background task with its own Sentry hub.
+///
+/// Hubs are thread-local and tokio moves tasks between worker threads, so a
+/// task spawned bare reports through whatever hub is bound to the thread it
+/// lands on — in practice an unrelated in-flight request. That is how a
+/// history parse failure arrived tagged with the URL of a routing request and
+/// carrying that request's breadcrumbs: two unrelated contexts merged into one
+/// event. It is misleading when debugging, and it is also how one caller's
+/// trail ends up attached to another caller's error.
+///
+/// A hub cloned from the current one gives the task its own scope and its own
+/// breadcrumb trail, while still inheriting the client and its scrubber.
+pub fn spawn_isolated<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use sentry::SentryFutureExt;
+    let hub = sentry::Hub::new_from_top(sentry::Hub::current());
+    tokio::spawn(future.bind_hub(hub))
+}
+
 /// Install Sentry, or don't.
 ///
 /// Returns `None` when `SENTRY_DSN` is unset or blank — the service then runs
@@ -334,6 +363,46 @@ pub fn init() -> Option<ClientInitGuard> {
 
 #[cfg(test)]
 mod tests {
+    /// Two background tasks must not share a breadcrumb trail.
+    ///
+    /// This is the bug behind a history parse failure arriving tagged with a
+    /// routing request's URL: hubs are thread-local, tokio moves tasks between
+    /// threads, and a bare spawn reports through whichever hub it lands on.
+    #[test]
+    fn background_tasks_do_not_share_a_breadcrumb_trail() {
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let events = sentry::test::with_captured_events(|| {
+            rt.block_on(async {
+                let noisy = spawn_isolated(async {
+                    sentry::add_breadcrumb(sentry::Breadcrumb {
+                        message: Some("belongs-to-another-task".into()),
+                        ..Default::default()
+                    });
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                });
+                let failing = spawn_isolated(async {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    sentry::capture_message("the task that failed", sentry::Level::Error);
+                });
+                let _ = noisy.await;
+                let _ = failing.await;
+            });
+        });
+
+        assert_eq!(events.len(), 1, "expected exactly the one capture");
+        let dumped = serde_json::to_string(&events[0]).unwrap();
+        assert!(
+            !dumped.contains("belongs-to-another-task"),
+            "one task's trail was attached to another's event: {dumped}"
+        );
+    }
+
     use super::*;
 
     #[test]

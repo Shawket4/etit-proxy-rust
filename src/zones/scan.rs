@@ -132,7 +132,7 @@ async fn do_run_scan(state: &AppState, summary: &mut ScanSummary) -> anyhow::Res
 }
 
 pub fn spawn_zone_scanner(state: AppState) {
-    tokio::spawn(async move {
+    crate::observability::spawn_isolated(async move {
         if state.cfg.zone_scan_on_startup {
             let _ = run_scan(state.clone()).await;
         }
