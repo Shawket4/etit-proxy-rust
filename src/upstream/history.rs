@@ -147,6 +147,7 @@ pub async fn fetch_range(
                     body_len = fixed.len(),
                     looks_like_html = fixed.trim_start().starts_with('<'),
                     error = %e,
+                    body = %crate::observability::sanitize_message(&truncate_for_log(&fixed, 400)),
                     "history JSON parse failed even after fix"
                 );
                 AppError::Parse(format!("history JSON: {e}"))
@@ -312,6 +313,7 @@ pub async fn fetch_trip_summary(
             body_len = fixed.len(),
             looks_like_html = fixed.trim_start().starts_with('<'),
             error = %e,
+            body = %crate::observability::sanitize_message(&truncate_for_log(&fixed, 400)),
             "trip summary JSON parse failed"
         );
         AppError::Parse(format!("summary JSON: {e}"))

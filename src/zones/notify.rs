@@ -52,10 +52,10 @@ pub async fn send_whatsapp_alert(
         // The body is the WhatsApp API echoing back the alert, which carries a
         // driver name, a zone and a timestamp. This error is warned on by the
         // caller, and a warn becomes a Sentry breadcrumb, which is exported
-        // like anything else. Compliance control: report the status, not the
-        // body. The body is read and dropped so the connection can be reused.
-        let _ = resp.text().await;
-        return Err(anyhow::anyhow!("WhatsApp API returned {}", status));
+        // like anything else — so it is cleaned before it goes anywhere.
+        let body = resp.text().await.unwrap_or_default();
+        let clean = crate::observability::sanitize_message(&body);
+        return Err(anyhow::anyhow!("WhatsApp API returned {}: {}", status, clean));
     }
 
     Ok(())

@@ -14,6 +14,7 @@
 //! process routinely. Do not relax `before_send`, and do not set
 //! `send_default_pii` to true, without a corresponding change to that policy.
 
+use regex::Regex;
 use std::borrow::Cow;
 
 use sentry::protocol::{Context, Event, Value};
@@ -50,11 +51,27 @@ const REDACT_FRAGMENTS: &[&str] = &[
     "payload",
     "response_text",
     "html",
+    // Value-of-a-payload key names. "text" is what a messaging API calls the
+    // thing a person wrote. Not "message": Sentry's own breadcrumbs use that
+    // field and redacting it would blank the trail.
+    "text",
+    "caption",
+    "content",
 ];
 
 /// Keys that are personal in full but too short to match as substrings —
 /// `lat` would otherwise match `plate` and `translate`.
-const REDACT_EXACT: &[&str] = &["lat", "lng", "lon", "long", "coords", "gps"];
+const REDACT_EXACT: &[&str] = &[
+    "lat", "lng", "lon", "long", "coords", "gps",
+    // The short credential names the long ones miss: the list had "password"
+    // and "passwd" but not "pass", which is what a login query string uses.
+    "pass", "pwd", "user", "auth", "apikey", "sig", "jwt", "otp", "pin", "creds",
+    // Keys whose VALUE is a person's name. "driver_name" was already caught by
+    // the "name" fragment; a bare "driver" was not, and that is what an
+    // upstream form body actually uses. Exact, so "driver_id" — an opaque id
+    // worth keeping — still comes through.
+    "driver", "employee", "owner", "contact", "person", "customer",
+];
 
 const REDACTED: &str = "[redacted]";
 
@@ -232,6 +249,31 @@ pub fn capture_upstream_failure(
 /// redacts by KEY and so cannot clean a free-text message, which means such an
 /// error must never be handed to `capture_upstream_failure`. This builds the
 /// message from the shape alone instead.
+pub fn capture_upstream_status_with_body(
+    service: &str,
+    operation: &str,
+    status: u16,
+    body: &str,
+) {
+    let clean = sanitize_message(body);
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("upstream.service", service);
+            scope.set_tag("upstream.operation", operation);
+            scope.set_tag("upstream.status", status);
+            if status == 429 {
+                scope.set_tag("upstream.throttled", "true");
+            }
+        },
+        || {
+            sentry::capture_message(
+                &format!("{service} {operation} returned {status}: {clean}"),
+                sentry::Level::Error,
+            );
+        },
+    );
+}
+
 pub fn capture_upstream_status(service: &str, operation: &str, status: u16) {
     sentry::with_scope(
         |scope| {
@@ -277,13 +319,15 @@ pub fn capture_batch_failure(operation: &str, failed: usize, total: usize) {
     );
 }
 
-/// Report a failure whose own message is not safe to export.
+/// Report a failure whose own message must be cleaned before it is exported.
 ///
 /// Some errors carry an upstream's response body, or the cookies from a login
-/// exchange, in their `Display`. The scrubber redacts by KEY and so cannot
-/// clean free text: the only safe thing to send is the shape. Compliance
-/// control — do not "improve" this by attaching the error.
-pub fn capture_opaque_failure(service: &str, operation: &str) {
+/// exchange, in their `Display`. The scrubber redacts by KEY and cannot clean
+/// free text — so the text goes through `sanitize_message` first, which is what
+/// makes attaching it safe. Compliance control: pass the detail here, never to
+/// `capture_message` directly.
+pub fn capture_sanitized_failure(service: &str, operation: &str, detail: &str) {
+    let clean = sanitize_message(detail);
     sentry::with_scope(
         |scope| {
             scope.set_tag("upstream.service", service);
@@ -291,7 +335,7 @@ pub fn capture_opaque_failure(service: &str, operation: &str) {
         },
         || {
             sentry::capture_message(
-                &format!("{service} {operation} failed"),
+                &format!("{service} {operation} failed: {clean}"),
                 sentry::Level::Error,
             );
         },
@@ -318,6 +362,76 @@ where
     use sentry::SentryFutureExt;
     let hub = sentry::Hub::new_from_top(sentry::Hub::current());
     tokio::spawn(future.bind_hub(hub))
+}
+
+/// Make a free-text error message safe to export.
+///
+/// The scrubber redacts by KEY, walking structured data. It cannot help with a
+/// message, which is why error text used to be withheld from Sentry entirely —
+/// safe, but it left events thin: an operation name and no indication of what
+/// actually went wrong.
+///
+/// This redacts inside the text instead, so the message can be attached in
+/// full. It targets the shapes personal data actually takes in an error
+/// string: a key=value pair in a URL query, a JSON field, a `key: value`
+/// fragment, an email address, a phone number, a bearer token. The key
+/// judgement is `is_sensitive`, the same one the scrubber uses, so the two
+/// cannot drift.
+///
+/// Compliance control. Deliberately conservative: over-redacting costs a
+/// little detail, under-redacting exports somebody's phone number.
+pub fn sanitize_message(s: &str) -> String {
+    use std::sync::OnceLock;
+
+    static QUERY_PAIR: OnceLock<Regex> = OnceLock::new();
+    static JSON_PAIR: OnceLock<Regex> = OnceLock::new();
+    static COLON_PAIR: OnceLock<Regex> = OnceLock::new();
+    static EMAIL: OnceLock<Regex> = OnceLock::new();
+    static JWT: OnceLock<Regex> = OnceLock::new();
+    static INTL_PHONE: OnceLock<Regex> = OnceLock::new();
+    static LOCAL_MOBILE: OnceLock<Regex> = OnceLock::new();
+
+    let query = QUERY_PAIR
+        .get_or_init(|| Regex::new(r"([A-Za-z_][\w\-.]*)=([^&\s\x22'<>]+)").unwrap());
+    let json = JSON_PAIR
+        .get_or_init(|| Regex::new(r#""([^"]{1,64})"\s*:\s*"([^"]*)""#).unwrap());
+    let colon = COLON_PAIR
+        .get_or_init(|| Regex::new(r"\b([A-Za-z_][\w\-.]*)\s*:\s+([^\s,;}]+)").unwrap());
+    let email = EMAIL.get_or_init(|| Regex::new(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+").unwrap());
+    let jwt = JWT.get_or_init(|| Regex::new(r"eyJ[\w\-]{4,}\.[\w\-]{4,}(\.[\w\-]+)?").unwrap());
+    let intl = INTL_PHONE.get_or_init(|| Regex::new(r"\+\d[\d\s\-]{8,16}\d").unwrap());
+    let local = LOCAL_MOBILE.get_or_init(|| Regex::new(r"\b01\d{9}\b").unwrap());
+
+    // Keep the key, replace the value: the message still says WHICH field was
+    // involved, which is usually the useful half.
+    let redact_pair = |caps: &regex::Captures| -> String {
+        let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+        let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        if !is_sensitive(key) {
+            return whole.to_string();
+        }
+        match whole.find([':', '=']) {
+            Some(i) => format!("{}{}", &whole[..=i], REDACTED),
+            None => whole.to_string(),
+        }
+    };
+
+    let out = query.replace_all(s, &redact_pair).into_owned();
+    let out = json.replace_all(&out, &redact_pair).into_owned();
+    let out = colon.replace_all(&out, &redact_pair).into_owned();
+    let out = email.replace_all(&out, REDACTED).into_owned();
+    let out = jwt.replace_all(&out, REDACTED).into_owned();
+    let out = intl.replace_all(&out, REDACTED).into_owned();
+    let mut out = local.replace_all(&out, REDACTED).into_owned();
+
+    // A message long enough to be a pasted payload is not a message.
+    const MAX_LEN: usize = 2000;
+    if out.len() > MAX_LEN {
+        let cut = (0..=MAX_LEN).rev().find(|i| out.is_char_boundary(*i)).unwrap_or(0);
+        out.truncate(cut);
+        out.push_str("…[truncated]");
+    }
+    out
 }
 
 /// Install Sentry, or don't.
@@ -363,6 +477,65 @@ pub fn init() -> Option<ClientInitGuard> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sanitize_redacts_credentials_and_people() {
+        let cases = [
+            (
+                r#"Get "https://fms-gps.etit-eg.com/login?user=admin&pass=hunter2": timeout"#,
+                vec!["hunter2"],
+                vec!["fms-gps.etit-eg.com", "timeout"],
+            ),
+            (
+                "redirect had Cookie: SSOCookie=abcdef; Path=/",
+                vec!["abcdef"],
+                vec!["redirect had"],
+            ),
+            (
+                r#"WhatsApp returned 400: {"to":"+201001234567","text":"salary sent"}"#,
+                vec!["201001234567", "salary sent"],
+                vec!["WhatsApp returned 400"],
+            ),
+            (
+                "notify failed for ops.lead@example.com",
+                vec!["ops.lead@example.com"],
+                vec!["notify failed"],
+            ),
+            (
+                "auth rejected: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig",
+                vec!["eyJhbGciOiJIUzI1NiJ9"],
+                vec!["auth rejected"],
+            ),
+        ];
+        for (input, absent, present) in cases {
+            let got = sanitize_message(input);
+            for a in absent {
+                assert!(!got.contains(a), "leaked {a:?}\n  in: {input}\n out: {got}");
+            }
+            for p in present {
+                assert!(got.contains(p), "over-redacted, lost {p:?}\n out: {got}");
+            }
+        }
+    }
+
+    /// The point of sanitizing rather than withholding: ordinary diagnostic
+    /// text must survive intact, or we have reinvented the empty message.
+    #[test]
+    fn sanitize_keeps_ordinary_errors() {
+        for s in [
+            "error sending request for url (https://fms-gps.etit-eg.com/WebPages/GetHistory.ashx)",
+            "expected value at line 1 column 1",
+            "connection refused (os error 61)",
+            "no rows returned by a query that expected to return at least one row",
+        ] {
+            assert_eq!(sanitize_message(s), s, "changed an ordinary error");
+        }
+    }
+
+    #[test]
+    fn sanitize_caps_pasted_payloads() {
+        assert!(sanitize_message(&"x".repeat(5000)).len() < 2100);
+    }
+
     /// Two background tasks must not share a breadcrumb trail.
     ///
     /// This is the bug behind a history parse failure arriving tagged with a
@@ -439,8 +612,11 @@ mod tests {
         redact(&mut v);
 
         assert_eq!(v["trip"]["id"], 7, "non-sensitive values are left alone");
-        assert_eq!(v["trip"]["driver"]["name"], REDACTED);
-        assert_eq!(v["trip"]["driver"]["phone"], REDACTED);
+        // A sensitive key takes its whole subtree with it, rather than being
+        // walked into and cleaned field by field. Costs the ids underneath;
+        // means a personal value under an innocent-looking key cannot survive
+        // inside a container we already know is personal.
+        assert_eq!(v["trip"]["driver"], REDACTED);
         assert_eq!(v["trip"]["stops"][0]["latitude"], REDACTED);
         assert_eq!(v["trip"]["stops"][0]["longitude"], REDACTED);
         assert_eq!(v["trip"]["stops"][0]["label"], "depot");

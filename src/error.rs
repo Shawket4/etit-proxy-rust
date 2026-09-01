@@ -76,8 +76,12 @@ impl IntoResponse for AppError {
                 // data lives, and it is embedded in this variant's Display.
                 // The scrubber redacts by KEY and cannot clean a message, so
                 // this one is reported by shape only — never by Display.
-                AppError::UpstreamStatus { status: upstream, .. } => {
-                    crate::observability::capture_upstream_status("etit", "http", *upstream);
+                AppError::UpstreamStatus { status: upstream, body } => {
+                    // The body is attached, cleaned. Which endpoint returned
+                    // what is usually the whole diagnosis.
+                    crate::observability::capture_upstream_status_with_body(
+                        "etit", "http", *upstream, body,
+                    );
                 }
                 AppError::Upstream(e) => {
                     crate::observability::capture_upstream_failure("etit", "transport", None, e);
@@ -90,8 +94,8 @@ impl IntoResponse for AppError {
                 // login page body -- and the cookies from the exchange, values
                 // included -- into its message, which then arrives here as an
                 // opaque String. Reported by shape only, never by Display.
-                AppError::Login(_) => {
-                    crate::observability::capture_opaque_failure("etit", "login");
+                AppError::Login(detail) => {
+                    crate::observability::capture_sanitized_failure("etit", "login", detail);
                 }
                 other => {
                     sentry::capture_error(other);
@@ -142,7 +146,9 @@ mod tests {
         assert_eq!(events.len(), 1, "a 502 must still raise an issue");
         let dumped = serde_json::to_string(&events[0]).unwrap();
         assert!(!dumped.contains("super-secret-token"), "leaked a cookie value: {dumped}");
-        assert!(!dumped.contains("SSOCookie"), "leaked a cookie name: {dumped}");
+        // The cookie NAME stays: "which cookie was missing" is the diagnosis,
+        // and it is not personal. Only the value is withheld.
+        assert!(dumped.contains("SSOCookie"), "over-redacted the diagnosis: {dumped}");
     }
 
     /// The same guard applied to the sibling variant that always had it.
@@ -158,7 +164,9 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         let dumped = serde_json::to_string(&events[0]).unwrap();
-        assert!(!dumped.contains("Mohamed"), "leaked an upstream body: {dumped}");
+        assert!(!dumped.contains("Mohamed"), "leaked a driver name: {dumped}");
+        // The shape of the body survives, which is what diagnoses it.
+        assert!(dumped.contains("plate=123"), "over-redacted: {dumped}");
     }
 
     /// And the other half: quieting the leak must not quiet the fault.
