@@ -68,3 +68,42 @@ pub struct UnblockResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_excerpt: Option<String>,
 }
+
+/// `POST /admin/routing/route` — one routed leg.
+///
+/// Exists so other services stop talking to OSRM directly. FalconGo used to
+/// build its own `/route/v1/driving` URL for fee-mapping enrichment, which
+/// meant it never applied the time-gated exclude this service applies, and the
+/// two produced different distances for the same pair of points. One caller,
+/// one rule.
+#[derive(Debug, Deserialize)]
+pub struct RouteRequest {
+    pub from_lat: f64,
+    pub from_lng: f64,
+    pub to_lat: f64,
+    pub to_lng: f64,
+    /// Intermediate waypoints, in order.
+    #[serde(default)]
+    pub via: Vec<[f64; 2]>,
+    /// Whether the time-gated truck roads must be excluded — i.e. whether the
+    /// vehicle is moving outside the tanker permit window. Defaults to true,
+    /// which is the conservative reading: a route that avoids restricted roads
+    /// is legal at any hour, whereas one that uses them is not.
+    #[serde(default = "default_restricted")]
+    pub restricted: bool,
+}
+
+fn default_restricted() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteResponse {
+    pub distance_km: f64,
+    pub duration_min: f64,
+    /// polyline5-encoded geometry, for callers that draw the route.
+    pub geometry: String,
+    /// Echoed so a caller can record which rule produced the number.
+    pub restricted: bool,
+}

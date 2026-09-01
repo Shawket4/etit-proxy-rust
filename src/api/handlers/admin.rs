@@ -96,3 +96,38 @@ pub async fn unblock_user(State(s): State<AppState>) -> AppResult<Json<UnblockRe
         body_excerpt: outcome.body_excerpt,
     }))
 }
+
+/// `POST /admin/routing/route`
+///
+/// The one place any service asks "how far is A from B by road".
+///
+/// FalconGo previously built its own OSRM URL for fee-mapping enrichment. That
+/// call had no `exclude`, so it routed tankers down time-gated roads this
+/// service deliberately avoids, and the same pair of points got two different
+/// distances depending on which codebase asked. Routing through here means the
+/// exclude class, the retry-without-exclude fallback and the base URL all have
+/// exactly one definition.
+pub async fn route(
+    State(s): State<AppState>,
+    Json(req): Json<crate::api::dto::RouteRequest>,
+) -> AppResult<Json<crate::api::dto::RouteResponse>> {
+    let via: Vec<(f64, f64)> = req.via.iter().map(|p| (p[0], p[1])).collect();
+
+    let routed = s
+        .osrm
+        .route(
+            (req.from_lat, req.from_lng),
+            (req.to_lat, req.to_lng),
+            &via,
+            req.restricted,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(crate::api::dto::RouteResponse {
+        distance_km: routed.distance_km,
+        duration_min: routed.duration_secs as f64 / 60.0,
+        geometry: routed.geometry,
+        restricted: req.restricted,
+    }))
+}

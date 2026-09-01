@@ -56,6 +56,10 @@ pub fn router(state: AppState) -> Router {
     let admin_state = state.clone();
     let admin = Router::new()
         .route("/cache/invalidate", post(handlers::admin::invalidate))
+        // The one place any service asks how far A is from B by road. See the
+        // handler: FalconGo used to build its own OSRM URL and silently skipped
+        // the time-gated exclude this service applies.
+        .route("/routing/route",    post(handlers::admin::route))
         .route("/auth/relogin",     post(handlers::admin::relogin))
         .route("/users/unblock",    post(handlers::admin::unblock_user))
         .route("/trip-audit/rescan", post(handlers::trip_audit::queue_rescan))
