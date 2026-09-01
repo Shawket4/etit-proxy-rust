@@ -496,6 +496,59 @@ pub fn init() -> Option<ClientInitGuard> {
 
 #[cfg(test)]
 mod tests {
+    /// The layer-order bug, pinned.
+    ///
+    /// axum applies layers in the reverse of tower's ServiceBuilder, so the
+    /// LAST .layer() is the outermost. With NewSentryLayer listed first it was
+    /// inner, SentryHttpLayer ran before any per-request hub existed, and its
+    /// configure_scope installed an event processor on the MAIN hub stamping
+    /// that request onto every subsequent event — forever, one per request.
+    ///
+    /// This drives a request through both layers in the shipped order and then
+    /// captures an unrelated event, as a background task would. The event must
+    /// carry no request at all. Swap the two .layer() lines below and it
+    /// carries the URL of the request that just went past, which is APEX-3.
+    #[test]
+    fn a_request_does_not_leave_its_url_on_later_events() {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let events = sentry::test::with_captured_events(|| {
+            let app = Router::new()
+                .route("/api/v1/vehicles/live", get(|| async { "ok" }))
+                // Shipped order: NewSentryLayer last, so it is outermost.
+                .layer(sentry_tower::SentryHttpLayer::new().enable_transaction())
+                .layer(sentry_tower::NewSentryLayer::new_from_top());
+
+            rt.block_on(async {
+                let req = axum::http::Request::builder()
+                    .uri("/api/v1/vehicles/live")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let _ = app.oneshot(req).await.unwrap();
+            });
+
+            // Now something unrelated fails, the way a history poller does.
+            sentry::capture_message("history parse failed", sentry::Level::Error);
+        });
+
+        let unrelated: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.as_deref() == Some("history parse failed"))
+            .collect();
+        assert_eq!(unrelated.len(), 1, "expected the one background event");
+        assert!(
+            unrelated[0].request.is_none(),
+            "a request leaked onto an unrelated event: {:?}",
+            unrelated[0].request,
+        );
+    }
+
     /// APEX-7 arrived with job.name redacted, so the event could not say which
     /// job had failed. The scrubber had eaten the tag that made it actionable.
     #[test]
