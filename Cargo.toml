@@ -68,6 +68,9 @@ sentry-tracing = "0.49"
 
 [dev-dependencies]
 tokio = { version = "1.40", features = ["test-util", "macros", "rt-multi-thread"] }
+# Enables sentry::test so the error funnel can assert what it does and does
+# not export. Test-only; the shipped binary is unaffected.
+sentry = { version = "0.49", features = ["test"] }
 
 [profile.release]
 opt-level     = 3

@@ -222,7 +222,7 @@ pub async fn login(http: &reqwest::Client, cfg: &Config) -> anyhow::Result<AuthS
             .get_all(reqwest::header::SET_COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .map(|s| s.split(';').next().unwrap_or(s).to_string())
+            .map(|s| s.split('=').next().unwrap_or(s).trim().to_string())
             .collect();
         return Err(anyhow!(
             "SSOCookie missing. Cookies on redirect GET: {seen_cookies:?}. \

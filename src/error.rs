@@ -85,6 +85,14 @@ impl IntoResponse for AppError {
                 AppError::SessionDead => {
                     crate::observability::capture_upstream_status("etit", "session", 401);
                 }
+                // Same hazard as UpstreamStatus above, reached by a path that
+                // bypassed the guard. `login()` puts 400 characters of the
+                // login page body -- and the cookies from the exchange, values
+                // included -- into its message, which then arrives here as an
+                // opaque String. Reported by shape only, never by Display.
+                AppError::Login(_) => {
+                    crate::observability::capture_opaque_failure("etit", "login");
+                }
                 other => {
                     sentry::capture_error(other);
                 }
@@ -112,3 +120,64 @@ impl IntoResponse for AppError {
 }
 
 pub type AppResult<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compliance control. `login()` builds its message out of the login page
+    /// body and the cookies from the exchange, so this variant must reach
+    /// Sentry by shape alone. The scrubber redacts by key and cannot clean a
+    /// free-text message, so this funnel is the only thing standing between a
+    /// session token and the issue tracker. Do not relax it.
+    #[test]
+    fn login_failures_are_reported_without_their_message() {
+        let events = sentry::test::with_captured_events(|| {
+            let _ = AppError::Login(
+                "login POST returned 200: SSOCookie=super-secret-token".into(),
+            )
+            .into_response();
+        });
+
+        assert_eq!(events.len(), 1, "a 502 must still raise an issue");
+        let dumped = serde_json::to_string(&events[0]).unwrap();
+        assert!(!dumped.contains("super-secret-token"), "leaked a cookie value: {dumped}");
+        assert!(!dumped.contains("SSOCookie"), "leaked a cookie name: {dumped}");
+    }
+
+    /// The same guard applied to the sibling variant that always had it.
+    #[test]
+    fn upstream_bodies_are_reported_without_their_message() {
+        let events = sentry::test::with_captured_events(|| {
+            let _ = AppError::UpstreamStatus {
+                status: 500,
+                body: "driver=Mohamed&plate=123".into(),
+            }
+            .into_response();
+        });
+
+        assert_eq!(events.len(), 1);
+        let dumped = serde_json::to_string(&events[0]).unwrap();
+        assert!(!dumped.contains("Mohamed"), "leaked an upstream body: {dumped}");
+    }
+
+    /// And the other half: quieting the leak must not quiet the fault.
+    #[test]
+    fn ordinary_server_faults_still_raise_an_issue() {
+        let events = sentry::test::with_captured_events(|| {
+            let _ = AppError::Internal(anyhow::anyhow!("disk on fire")).into_response();
+        });
+        assert_eq!(events.len(), 1);
+    }
+
+    /// A caller sending nonsense is not a fault here, and must stay silent.
+    #[test]
+    fn client_errors_are_not_reported() {
+        let events = sentry::test::with_captured_events(|| {
+            let _ = AppError::BadRequest("no such date".into()).into_response();
+            let _ = AppError::NotFound("vehicle".into()).into_response();
+            let _ = AppError::Unauthorized.into_response();
+        });
+        assert!(events.is_empty(), "4xx must not raise issues: {events:?}");
+    }
+}

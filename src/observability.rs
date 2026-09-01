@@ -244,6 +244,53 @@ pub fn capture_upstream_status(service: &str, operation: &str, status: u16) {
     );
 }
 
+/// Report a fan-out round that failed wholesale.
+///
+/// Per-item failures in a background round are ordinary — a device is offline,
+/// a vehicle has no data for the day. Reporting each one would flood Sentry and
+/// train everyone to scroll past it. What matters is the shape of the round:
+/// when every item fails, the pipeline is down, and no request is in flight to
+/// carry that error to anyone.
+///
+/// At most one event per round, and only counts cross the wire — never the
+/// identifiers of the items that failed, which are vehicles and so are people.
+pub fn capture_batch_failure(operation: &str, failed: usize, total: usize) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("batch.operation", operation);
+            scope.set_tag("batch.failed", failed as u64);
+            scope.set_tag("batch.total", total as u64);
+        },
+        || {
+            sentry::capture_message(
+                &format!("{operation}: {failed} of {total} failed"),
+                sentry::Level::Error,
+            );
+        },
+    );
+}
+
+/// Report a failure whose own message is not safe to export.
+///
+/// Some errors carry an upstream's response body, or the cookies from a login
+/// exchange, in their `Display`. The scrubber redacts by KEY and so cannot
+/// clean free text: the only safe thing to send is the shape. Compliance
+/// control — do not "improve" this by attaching the error.
+pub fn capture_opaque_failure(service: &str, operation: &str) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("upstream.service", service);
+            scope.set_tag("upstream.operation", operation);
+        },
+        || {
+            sentry::capture_message(
+                &format!("{service} {operation} failed"),
+                sentry::Level::Error,
+            );
+        },
+    );
+}
+
 /// Install Sentry, or don't.
 ///
 /// Returns `None` when `SENTRY_DSN` is unset or blank — the service then runs
