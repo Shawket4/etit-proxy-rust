@@ -210,3 +210,56 @@ current pin (if any), `offset_m`, `stop_count`.
 ### 5.7 `POST /trip-audit/suggestions/:id/ack` — body `{ "status": "accepted"|"dismissed" }`
 Records the inbox decision (the pin itself is written via the FalconGo
 locations API).
+
+## 6. Dead Zones (`/api/v1/zones`)
+
+Circular geofences the fleet is scanned against. CRUD is
+`GET /zones?active=`, `GET|PUT|DELETE /zones/:id`, `POST /zones`
+(`{ name, lat, lng, radius_m, active? }`); `DELETE` is a soft delete
+(`active = 0`).
+
+### 6.1 `POST /zones/scan` — body `{ "from": "YYYY-MM-DD", "to": "YYYY-MM-DD" }?`
+
+Two modes, and the body is what picks between them:
+
+* **No body (or `{}`) — scheduled.** The nightly round: scans the configured
+  lookback (`ZONE_LOOKBACK_DAYS`), records each visit in `zone_visits`, and
+  **sends a WhatsApp alert** for every visit not alerted on yet.
+* **`from` + `to` — manual.** Scans those inclusive local days and **returns a
+  report**: it writes no visit rows and sends nothing to the WhatsApp group, so
+  it is safe to re-run over the same range while investigating.
+
+Both ends must be given together, `to` must not precede `from`, and the range
+may span at most 92 days — anything else is a `400`, never a silent fallback to
+the alerting round.
+
+Response (`ScanSummary`):
+
+```jsonc
+{
+  "run_id": 41,
+  "status": "success",            // or "error"
+  "mode": "manual",               // or "scheduled"
+  "from": "2026-09-01",           // days actually covered, inclusive
+  "to": "2026-09-07",
+  "days_scanned": 7,
+  "vehicles_scanned": 38,
+  "violations_found": 3,
+  "alerts_sent": 0,               // always 0 for "manual"
+  "violations": [                 // populated for "manual" only
+    {
+      "vehicle_id": "12345",
+      "codename": "TRK-14",
+      "zone_id": 2,
+      "zone_name": "Cairo depot",
+      "zone_lat": 30.0444,
+      "zone_lng": 31.2357,
+      "entry_local": "2026-09-03 01:12:40",  // org timezone
+      "exit_local": "2026-09-03 03:41:02",
+      "dwell_secs": 8902,
+      "point_count": 74
+    }
+  ],
+  "error": null
+}
+```

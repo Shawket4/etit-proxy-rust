@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     Json,
 };
@@ -7,7 +8,7 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::zones::{DeadZone, ScanSummary};
-use crate::zones::scan::run_scan;
+use crate::zones::scan::{run_scan_window, ScanWindow, MAX_MANUAL_RANGE_DAYS};
 
 #[derive(Deserialize)]
 pub struct ListZonesQuery {
@@ -114,9 +115,128 @@ pub async fn delete(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Optional body for `POST /zones/scan`. Given `from` and `to` (local
+/// `YYYY-MM-DD` days, inclusive) the scan runs in manual mode: it reports the
+/// violations it found in the response and sends no WhatsApp alert. With no
+/// body it runs the scheduled round over the configured lookback, alerts and
+/// all — which is what the nightly timer calls.
+#[derive(Deserialize, Default)]
+pub struct ScanReq {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
 pub async fn run_scan_now(
     State(s): State<AppState>,
+    body: Bytes,
 ) -> AppResult<Json<ScanSummary>> {
-    let summary = run_scan(s).await;
+    // Read as bytes rather than `Option<Json<_>>`: that extractor turns any
+    // rejection — a typo'd body, a missing content-type — into `None`, and
+    // `None` here means "scheduled round", which alerts the WhatsApp group. A
+    // malformed manual request must fail, not notify everyone.
+    let req: ScanReq = if body.is_empty() {
+        ScanReq::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::BadRequest(format!("invalid scan body: {e}")))?
+    };
+    let window = parse_window(req)?;
+    let summary = run_scan_window(s, window).await;
     Ok(Json(summary))
+}
+
+fn parse_window(req: ScanReq) -> AppResult<ScanWindow> {
+    let (from, to) = match (req.from.as_deref(), req.to.as_deref()) {
+        (None, None) => return Ok(ScanWindow::Scheduled),
+        // Half a range is a client bug, not a shorthand: guessing the other end
+        // would silently scan — and report on — days nobody asked about.
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(AppError::BadRequest("from and to must be given together".into()))
+        }
+        (Some(f), Some(t)) => (f, t),
+    };
+
+    let parse = |label: &str, raw: &str| {
+        chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+            .map_err(|_| AppError::BadRequest(format!("{label} must be a YYYY-MM-DD date")))
+    };
+    let from = parse("from", from)?;
+    let to = parse("to", to)?;
+
+    if to < from {
+        return Err(AppError::BadRequest("to must not be before from".into()));
+    }
+    let span = (to - from).num_days() + 1;
+    if span > MAX_MANUAL_RANGE_DAYS {
+        return Err(AppError::BadRequest(format!(
+            "range must span at most {MAX_MANUAL_RANGE_DAYS} days (got {span})"
+        )));
+    }
+
+    Ok(ScanWindow::Manual { from, to })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::zones::scan::ScanWindow;
+
+    fn req(from: Option<&str>, to: Option<&str>) -> ScanReq {
+        ScanReq {
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_dates_runs_the_scheduled_round() {
+        assert!(matches!(
+            parse_window(req(None, None)).unwrap(),
+            ScanWindow::Scheduled
+        ));
+    }
+
+    #[test]
+    fn a_full_range_runs_manually() {
+        let w = parse_window(req(Some("2026-09-01"), Some("2026-09-03"))).unwrap();
+        match w {
+            ScanWindow::Manual { from, to } => {
+                assert_eq!(from.to_string(), "2026-09-01");
+                assert_eq!(to.to_string(), "2026-09-03");
+            }
+            _ => panic!("expected a manual window"),
+        }
+    }
+
+    #[test]
+    fn a_single_day_is_a_valid_range() {
+        assert!(matches!(
+            parse_window(req(Some("2026-09-01"), Some("2026-09-01"))).unwrap(),
+            ScanWindow::Manual { .. }
+        ));
+    }
+
+    // Half a range must not quietly become a scheduled round — that round
+    // alerts the WhatsApp group.
+    #[test]
+    fn half_a_range_is_rejected() {
+        assert!(parse_window(req(Some("2026-09-01"), None)).is_err());
+        assert!(parse_window(req(None, Some("2026-09-01"))).is_err());
+    }
+
+    #[test]
+    fn a_backwards_or_unparseable_range_is_rejected() {
+        assert!(parse_window(req(Some("2026-09-03"), Some("2026-09-01"))).is_err());
+        assert!(parse_window(req(Some("01/09/2026"), Some("03/09/2026"))).is_err());
+    }
+
+    #[test]
+    fn a_range_longer_than_the_cap_is_rejected() {
+        let from = "2026-01-01";
+        let ok = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d").unwrap()
+            + chrono::Days::new(MAX_MANUAL_RANGE_DAYS as u64 - 1);
+        let too_long = ok + chrono::Days::new(1);
+        assert!(parse_window(req(Some(from), Some(&ok.to_string()))).is_ok());
+        assert!(parse_window(req(Some(from), Some(&too_long.to_string()))).is_err());
+    }
 }
