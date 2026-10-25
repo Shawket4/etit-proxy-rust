@@ -37,15 +37,23 @@ jobs:
           WORKDIR /app
           COPY . .
 
-          RUN cargo build --release --verbose
-          RUN strip target/release/etit-proxy || true
-          RUN ls -lh target/release/etit-proxy
+          # x86-64-v4 (AVX-512): the VPS is an AMD EPYC 9354P (checked 2026-10-25,
+
+          # `ld.so --help` lists v4 as supported). The explicit --target keeps the
+
+          # flag off build scripts and proc macros, which run on the CI machine.
+
+          ENV RUSTFLAGS="-C target-cpu=x86-64-v4"
+
+          RUN cargo build --release --target x86_64-unknown-linux-gnu --verbose
+          RUN strip target/x86_64-unknown-linux-gnu/release/etit-proxy || true
+          RUN ls -lh target/x86_64-unknown-linux-gnu/release/etit-proxy
           EOF
 
           docker build -t etit-proxy-builder -f Dockerfile.build .
 
           docker create --name temp-container etit-proxy-builder
-          docker cp temp-container:/app/target/release/etit-proxy ./etit-proxy
+          docker cp temp-container:/app/target/x86_64-unknown-linux-gnu/release/etit-proxy ./etit-proxy
           docker rm temp-container
 
           ls -la etit-proxy
