@@ -5,7 +5,7 @@
 use serde::Deserialize;
 
 use crate::domain::history::{SensorEvent, Stop};
-use crate::domain::time::{etit_format_for_history, parse_etit_local, Timestamp};
+use crate::domain::time::{etit_format_for_history, parse_etit_local, parse_etit_local_after, Timestamp};
 use crate::domain::HistoryPoint;
 use crate::error::AppError;
 
@@ -164,7 +164,12 @@ pub async fn fetch_range(
 fn flatten(env: Envelope, tz: chrono_tz::Tz) -> UpstreamHistory {
     let (history_rows, stop_rows, sensor_rows) = env.into_parts();
 
+    // Every timestamp in this payload is Cairo wall clock (`TIMEZONE`) — the
+    // same zone the query was sent in; see `domain::time` for the per-field
+    // table. Rows arrive in chronological order, which is what lets the
+    // autumn repeated hour resolve forward instead of folding back.
     let mut points = Vec::new();
+    let mut prev: Option<Timestamp> = None;
     for row in history_rows {
         let speed = row
             .s
@@ -178,7 +183,10 @@ fn flatten(env: Envelope, tz: chrono_tz::Tz) -> UpstreamHistory {
             .ok()
             .map(|f| f.max(0.0).round() as u32)
             .unwrap_or(0);
-        let timestamp = parse_etit_local(&row.d, tz);
+        let timestamp = parse_etit_local_after(&row.d, tz, prev);
+        if timestamp.is_some() {
+            prev = timestamp;
+        }
 
         for pt in row.p {
             let lat = pt.a.parse::<f64>().unwrap_or(0.0);
@@ -199,8 +207,9 @@ fn flatten(env: Envelope, tz: chrono_tz::Tz) -> UpstreamHistory {
     for s in stop_rows {
         let lat = s.lat.parse::<f64>().unwrap_or(0.0);
         let lng = s.lon.parse::<f64>().unwrap_or(0.0);
-        let from = parse_etit_local(&s.from, tz).unwrap_or_default();
-        let to = parse_etit_local(&s.to, tz).unwrap_or_default();
+        let from = parse_etit_local(&s.from, tz);
+        let to = parse_etit_local_after(&s.to, tz, from).unwrap_or_default();
+        let from = from.unwrap_or_default();
         stops.push(Stop {
             lat,
             lng,
@@ -215,13 +224,7 @@ fn flatten(env: Envelope, tz: chrono_tz::Tz) -> UpstreamHistory {
     for s in sensor_rows {
         let lat = s.lat.parse::<f64>().unwrap_or(0.0);
         let lng = s.lon.parse::<f64>().unwrap_or(0.0);
-        // Clean up "Start Time : 25/04/2026 01:06:34"
-        let date_str = s
-            .start_date
-            .split_once(':')
-            .map(|(_, d)| d.trim())
-            .unwrap_or(&s.start_date);
-        let timestamp = parse_etit_local(date_str, tz).unwrap_or_default();
+        let timestamp = parse_etit_local(sensor_date(&s.start_date), tz).unwrap_or_default();
         sensors.push(SensorEvent {
             lat,
             lng,
@@ -234,6 +237,18 @@ fn flatten(env: Envelope, tz: chrono_tz::Tz) -> UpstreamHistory {
         points,
         stops,
         sensors,
+    }
+}
+
+/// The date inside a sensor's `strtDate`, which arrives labelled —
+/// `"Start Time : 25/04/2026 01:06:34"`. Everything before the first digit is
+/// the label. (Splitting on the first `:` instead would cut a bare
+/// `25/04/2026 01:06:34` at the hour and drop the event to 1970.)
+fn sensor_date(raw: &str) -> &str {
+    let s = raw.trim();
+    match s.find(|c: char| c.is_ascii_digit()) {
+        Some(i) => s[i..].trim(),
+        None => s,
     }
 }
 
@@ -337,4 +352,66 @@ pub async fn fetch_trip_summary(
         ignition_off_count: row.sensor1.split('#').next().unwrap_or("0").to_string(),
         ignition_on_count: row.sensor2.split('#').next().unwrap_or("0").to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn utc(s: &str) -> Timestamp {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    const CAIRO: chrono_tz::Tz = chrono_tz::Africa::Cairo;
+
+    fn parse(body: &str) -> UpstreamHistory {
+        let fixed = fix_unquoted_json_keys(body);
+        let v: serde_json::Value = serde_json::from_str(body)
+            .or_else(|_| serde_json::from_str(&fixed))
+            .expect("json");
+        flatten(serde_json::from_value(v).expect("envelope"), CAIRO)
+    }
+
+    #[test]
+    fn history_stops_and_sensors_are_cairo_wall_clock() {
+        let h = parse(
+            r#"{"history":[{"p":[{"a":"26.84","o":"33.92"}],"d":"25/10/2026 10:18:00","s":"52","l":"80"}],
+                "stops":[{"lat":"26.8","lon":"33.9","from":"25/10/2026 06:00:00","to":"25/10/2026 07:30:00","duration":"1h 30m","address":"x"}],
+                "Sensors":[{"lat":"26.8","lon":"33.9","strtDate":"Start Time : 25/10/2026 01:06:34","typeName":"Ignition On"}]}"#,
+        );
+        assert_eq!(h.points[0].timestamp, Some(utc("2026-10-25T07:18:00Z")));
+        assert_eq!(h.stops[0].from, utc("2026-10-25T03:00:00Z"));
+        assert_eq!(h.stops[0].to, utc("2026-10-25T04:30:00Z"));
+        assert_eq!(h.sensors[0].timestamp, utc("2026-10-24T22:06:34Z"));
+    }
+
+    #[test]
+    fn sensor_date_with_or_without_label() {
+        assert_eq!(sensor_date("Start Time : 25/04/2026 01:06:34"), "25/04/2026 01:06:34");
+        assert_eq!(sensor_date("25/04/2026 01:06:34"), "25/04/2026 01:06:34");
+        assert_eq!(sensor_date("  "), "");
+    }
+
+    /// The repeated hour on 2026-10-29: a track crossing 24:00 EEST → 23:00
+    /// EET must stay monotonic rather than jump back an hour.
+    #[test]
+    fn history_track_through_fall_back_stays_monotonic() {
+        let h = parse(
+            r#"[{"p":[{"a":"1","o":"1"}],"d":"29/10/2026 23:50:00","s":"0","l":"0"},
+                {"p":[{"a":"1","o":"1"}],"d":"29/10/2026 23:10:00","s":"0","l":"0"},
+                {"p":[{"a":"1","o":"1"}],"d":"29/10/2026 23:55:00","s":"0","l":"0"},
+                {"p":[{"a":"1","o":"1"}],"d":"30/10/2026 00:05:00","s":"0","l":"0"}]"#,
+        );
+        let ts: Vec<_> = h.points.iter().map(|p| p.timestamp.unwrap()).collect();
+        assert_eq!(
+            ts,
+            vec![
+                utc("2026-10-29T20:50:00Z"), // 23:50 EEST
+                utc("2026-10-29T21:10:00Z"), // 23:10 EET (second pass)
+                utc("2026-10-29T21:55:00Z"), // 23:55 EET
+                utc("2026-10-29T22:05:00Z"), // 00:05 EET
+            ],
+        );
+    }
 }

@@ -34,6 +34,12 @@ pub struct Config {
 
     // ---- Timezone -----------------------------------------------------------
     pub timezone: Tz,
+    /// Zone of `GetTransportersPage.LastLocationDate` (Tier A). Unlike every
+    /// other ETIT time — Cairo wall clock — this one arrives in UTC: read as
+    /// Cairo it put each vehicle's last fix three hours in the past (observed
+    /// 2026-10-25). `ETIT_LAST_LOCATION_TZ`, default `UTC`; set it to
+    /// `Africa/Cairo` to restore the old reading without a rebuild.
+    pub etit_last_location_tz: Tz,
 
     // ---- Tiers --------------------------------------------------------------
     pub tier_a_refresh: Duration,
@@ -142,6 +148,11 @@ impl Config {
         let tz_name = std::env::var("TIMEZONE").unwrap_or_else(|_| "Africa/Cairo".into());
         let timezone = Tz::from_str(&tz_name)
             .map_err(|_| anyhow!("TIMEZONE `{tz_name}` is not a valid IANA zone"))?;
+        let last_loc_tz_name =
+            optional_env("ETIT_LAST_LOCATION_TZ").unwrap_or_else(|| "UTC".into());
+        let etit_last_location_tz = Tz::from_str(&last_loc_tz_name).map_err(|_| {
+            anyhow!("ETIT_LAST_LOCATION_TZ `{last_loc_tz_name}` is not a valid IANA zone")
+        })?;
 
         let tier_a_refresh   = secs_or("TIER_A_REFRESH_SECS",   24 * 60 * 60)?;
         let tier_b_poll      = secs_or("TIER_B_POLL_SECS",      60)?;
@@ -239,6 +250,7 @@ impl Config {
             cors_origins,
             database_url,
             timezone,
+            etit_last_location_tz,
             tier_a_refresh,
             tier_b_poll,
             tier_c_poll,
