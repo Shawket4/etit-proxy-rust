@@ -94,7 +94,13 @@ defaults. The most important:
 
 - `ETIT_DATA_URL` / `ETIT_LOGIN_URL` / `ETIT_USERNAME` / `ETIT_PASSWORD` — required.
 - `DATABASE_URL` — defaults to `sqlite://./data/etit.db?mode=rwc`.
-- `TIMEZONE` — IANA name; defaults to `Africa/Cairo`.
+- `TIMEZONE` — IANA name; defaults to `Africa/Cairo`. The zone of ETIT's
+  wall-clock times (live status, history points, stops, sensors) and of the
+  day boundaries.
+- `ETIT_LAST_LOCATION_TZ` — zone of the vehicle list's `LastLocationDate`,
+  which ETIT sends in UTC; defaults to `UTC`. Only a rollback knob.
+- `ETIT_SUB_ID` / `ETIT_STAFF_ID` — optional; posted only to
+  `GetTransportersPage`. Unset ⇒ scraped from the post-login page, else zeros.
 - `TIER_B_POLL_SECS` — live-status refresh interval (default 60).
 - `TIER_C_POLL_SECS` — hot-history refresh interval (default 1800).
 - `TIER_C_CONCURRENCY` — concurrent upstream history fetches (default 4).

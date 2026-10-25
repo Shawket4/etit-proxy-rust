@@ -1,7 +1,9 @@
 //! Live-status service.
 //!
 //! Reads are cheap: the Tier B poller fully overwrites the live snapshot
-//! every minute, so handlers just clone the in-memory snapshot. On cold
+//! every minute, so handlers just clone the in-memory snapshot. Each refresh
+//! also updates the live columns of the vehicle list and the `vehicles`
+//! table (see `VehiclesService::persist_live`). On cold
 //! start (before the first Tier B tick) we fall back to a synchronous fetch
 //! so the dashboard isn't blank for the first 60s.
 
@@ -65,7 +67,10 @@ impl LiveService {
             return Ok(self.cache.live_snapshot());
         }
         let rows = up::fetch_live(&self.client, &vehicles).await?;
+        // Also folds the readings into the vehicle list's live columns…
         self.cache.store_live(rows);
+        // …which then go to SQLite, so the table and a restart see them too.
+        self.vehicles.persist_live().await;
         Ok(self.cache.live_snapshot())
     }
 }

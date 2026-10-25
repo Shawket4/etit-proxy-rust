@@ -27,18 +27,23 @@ The middleware looks for the token in:
 ## 2. Data Structures
 
 ### 2.1 `Vehicle`
-Metadata about a tracked unit.
+Metadata about a tracked unit, plus its last known live state. The metadata
+(`id`…`speedLimit`) comes from the daily ETIT vehicle list; the live fields
+(`online`…`lng`) are rewritten from every live poll (default each minute), so
+they are as current as `/vehicles/live` — and persisted, so they survive a
+restart.
 | Field | Type | Description |
 | :--- | :--- | :--- |
 | `id` | `string` | Unique identifier (UUID). |
 | `codename` | `string` | Raw label (e.g., "OL-1/ABC1234"). |
 | `plate` | `string` | Extracted plate number. |
 | `speedLimit` | `number` | km/h limit for this vehicle. |
-| `online` | `boolean` | True if currently connected to ETIT. |
+| `online` | `boolean` | False when the last live status was `12` (Offline). |
 | `speed` | `number` | Last known speed in km/h. |
 | `status` | `number` | Raw status integer. |
 | `statusLabel` | `string` | Friendly label (e.g., "Moving"). |
-| `lastLocationAt` | `string?` | ISO-8601 timestamp of last fix. |
+| `lastLocationAt` | `string?` | ISO-8601 UTC timestamp of last fix. |
+| `lat` / `lng` | `number?` | Last known position; absent until the first live poll. |
 
 ### 2.2 `LiveVehicleStatus`
 Real-time tracking snapshot.

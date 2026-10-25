@@ -48,7 +48,9 @@ pub async fn fetch_all(client: &EtitClient) -> Result<Vec<Vehicle>, AppError> {
         auth
     };
 
-    let tz = client.config().timezone;
+    // LastLocationDate is UTC, not the Cairo wall clock the other endpoints
+    // speak — see `Config::etit_last_location_tz`.
+    let tz = client.config().etit_last_location_tz;
     let mut all = Vec::new();
 
     for page in 1..=PAGE_HARD_CAP {
@@ -135,6 +137,8 @@ fn convert(row: UpstreamRow, tz: Tz) -> Vehicle {
         status,
         status_label:     status_label_str,
         last_location_at,
+        lat:              None,
+        lng:              None,
         extra,
     }
 }
@@ -174,5 +178,38 @@ fn coerce(v: Value) -> Value {
             Value::String(s)
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(last: &str) -> UpstreamRow {
+        serde_json::from_value(serde_json::json!({
+            "ID": "v1",
+            "codename": "OL/8567",
+            "SpeedLimit": "80",
+            "OnlineFlag": "True",
+            "Speed": "86",
+            "Status": "1",
+            "LastLocationDate": last,
+            "Driver": "x",
+        }))
+        .unwrap()
+    }
+
+    /// LastLocationDate is UTC: 06:48:43 is 09:48 Cairo, minutes before the
+    /// 09:55 Cairo restart on 2026-10-25 — not 03:48Z, three hours stale.
+    #[test]
+    fn last_location_date_is_read_as_utc() {
+        let v = convert(row("25/10/2026 06:48:43"), chrono_tz::UTC);
+        assert_eq!(
+            v.last_location_at.map(|t| t.to_rfc3339()),
+            Some("2026-10-25T06:48:43+00:00".to_string()),
+        );
+        assert_eq!((v.plate.as_str(), v.speed, v.status), ("8567", 86, 1));
+        assert!(v.online);
+        assert_eq!(v.extra.get("Driver"), Some(&serde_json::json!("x")));
     }
 }

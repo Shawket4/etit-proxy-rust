@@ -116,6 +116,7 @@ pub(crate) fn parse_live(
         let status_label_ = status_label(status).to_string();
         let lng           = cols[3][i].parse::<f64>().unwrap_or(0.0);
         let lat           = cols[4][i].parse::<f64>().unwrap_or(0.0);
+        // Cairo wall clock (`TIMEZONE`), unlike Tier A's UTC LastLocationDate.
         let timestamp     = parse_etit_local(cols[5][i], tz);
 
         // Scan extra columns for this row.
@@ -171,6 +172,8 @@ mod tests {
             status: 1,
             status_label: "Moving".into(),
             last_location_at: None,
+            lat: None,
+            lng: None,
             extra: Default::default(),
         }
     }
@@ -204,7 +207,11 @@ mod tests {
         assert!((out[0].lng - 33.923).abs() < 1e-6);
         assert_eq!(out[0].plate.as_deref(), Some("P1"));
         assert_eq!(out[0].event.as_deref(), Some("Ignition On"));
-        assert!(out[0].timestamp.is_some());
+        // "26 April 2026 16:28" is Cairo wall clock (EEST) → 13:28Z.
+        assert_eq!(
+            out[0].timestamp.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2026-04-26T13:28:00+00:00"),
+        );
     }
 
     #[test]
