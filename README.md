@@ -84,8 +84,14 @@ See [`API.md`](./API.md) for the full reference. The short version:
 - `POST /admin/cache/invalidate`        — `{"scope": "all|vehicles|live|history"}`
 - `POST /admin/auth/relogin`            — force ETIT re-login
 
+- `POST /admin/routing/route`          — truck route A → B (Valhalla)
+- `POST /admin/routing/optimize`       — best order to visit several stops
+- `GET  /service/trip-audit/driven-km`  — how far trucks drove a terminal → drop-off route
+
 Admin routes require an `X-Admin-Token` header that matches `ADMIN_TOKEN`.
-If `ADMIN_TOKEN` is unset, all admin routes are 404'd.
+If `ADMIN_TOKEN` is unset, all admin routes are 404'd. `/service/*` is the
+read-only surface other Apex services call. It takes an `X-Service-Token`
+matching `SERVICE_READ_TOKEN` and is 404'd when that is unset.
 
 ## Configuration
 
@@ -105,6 +111,15 @@ defaults. The most important:
 - `TIER_C_POLL_SECS` — hot-history refresh interval (default 1800).
 - `TIER_C_CONCURRENCY` — concurrent upstream history fetches (default 4).
 - `ADMIN_TOKEN` — enables `/admin/*`.
+- `VALHALLA_URL` — the routing engine (default `http://127.0.0.1:8002`). All road
+  routing, map matching and distance matrices go through it; see
+  [`docs/valhalla.md`](docs/valhalla.md).
+- `VALHALLA_TIME_BANS` — the build's `apex-time-bans.json`, for the trip audit's
+  `banned_road` flag. Re-read at every scan.
+- `TRUCK_HEIGHT_M` 4.0, `TRUCK_WIDTH_M` 2.6, `TRUCK_LENGTH_M` 16.5, `TRUCK_WEIGHT_T`
+  40, `TRUCK_AXLE_LOAD_T` 10, `TRUCK_AXLE_COUNT` 5, `TRUCK_HAZMAT` true,
+  `TRUCK_TOP_SPEED_KMH` 90 — the tanker every route is planned for.
+- `SERVICE_READ_TOKEN` — enables the read-only `/service/*` (the fee lookup's driven km). Keep it different from `ADMIN_TOKEN`.
 
 ## Performance notes
 

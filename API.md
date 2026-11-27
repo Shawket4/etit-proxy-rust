@@ -182,6 +182,45 @@ Requires `X-Admin-Token` header.
 
 
 
+### 4.4 `POST /admin/routing/route`
+
+The one place any service asks "how far is A from B by road" (FalconGo fee
+mappings and trip summaries, the advisor). Routed by Valhalla for the
+configured tanker (`TRUCK_*`), time bans included.
+
+```jsonc
+// request
+{ "from_lat": 30.146, "from_lng": 31.286, "to_lat": 30.7865, "to_lng": 31.0004,
+  "via": [[30.4, 31.1]],                     // optional, in order
+  "depart_at": "2026-11-28T13:00:00+02:00",  // optional, RFC 3339
+  "restricted": true }                       // used only without depart_at
+// response
+{ "distanceKm": 87.9, "durationMin": 74.2, "geometry": "<polyline5>",
+  "restricted": true, "departure": "2026-11-28T13:00", "engine": "valhalla" }
+```
+
+Without `depart_at`, `restricted: true` (the default) plans a route that is
+legal at any hour: it leaves inside the ban windows, so every time-banned road
+is avoided. That is what a stored reference distance needs. `restricted:
+false` means leaving now. `departure` is `"any_hour"` or the local time used.
+
+### 4.5 `POST /admin/routing/optimize`
+
+Visit several stops in the best order (Valhalla `optimized_route`, truck,
+minimising time).
+
+```jsonc
+// request: end defaults to start (a round trip)
+{ "start": {"lat": 30.146, "lng": 31.286},
+  "stops": [{"lat": 30.7865, "lng": 31.0004}, {"lat": 30.466, "lng": 31.1858}],
+  "end": null, "depart_at": null, "restricted": true }
+// response
+{ "order": [1, 0],                            // indices into stops
+  "legs": [{"distanceKm": 43.1, "durationMin": 32.0, "geometry": "<polyline5>"}, …],
+  "distanceKm": 227.2, "durationMin": 186.0, "geometry": "<polyline5, whole trip>",
+  "departure": "any_hour", "engine": "valhalla" }
+```
+
 ## 5. Trip Audit (`/api/v1/trip-audit/*`)
 
 Populated by the nightly scanner (`TRIP_SCAN_TIME`). All endpoints require the
@@ -194,10 +233,27 @@ One row per audited parent trip. `status` ∈ `matched|partial|unmatched`;
 `distance_ratio`, `duration_ratio`), and review state.
 
 ### 5.2 `GET /trip-audit/matches/:id`
-Match + `legs[]` (per-leg actual vs OSRM, `actual_geometry`/`osrm_geometry`
+Match + `legs[]` (per-leg actual vs best truck route, `actual_geometry`/`osrm_geometry`
 polyline5, `max_deviation_m`, `night_window`) + `flags[]`
 (`excess_distance|excess_duration|unplanned_stop|route_deviation|`
-`skipped_delivery|no_return_data|no_terminal_departure`, `details_json`).
+`skipped_delivery|no_return_data|no_terminal_departure|banned_road|`
+`suboptimal_order|ineffective_bundling`, `details_json`).
+
+**Routing.** `osrm_*` fields are legacy names: since 2026-11-27 they hold
+Valhalla truck-route figures (see `docs/valhalla.md`). Each leg is routed for
+a truck leaving at that leg's real departure time, so time-of-day bans apply
+as they did when it was driven.
+
+**`banned_road`** (critical): the leg, map-matched to OSM ways, drove a road
+closed to the fleet (`valhalla/time-bans.json`) while it was closed. One flag
+per continuous stretch; `details_json`:
+`{ leg_seq, ban_id, road, road_ar, always, banned_hours, from_ts, to_ts (epoch s), km, roads: [names] }`.
+`always: true` (26th of July, the Ahmed Hamdi tunnels) means closed at every
+hour and `banned_hours` is null; a timed ban has `always: false` and
+`banned_hours: "07:00-20:00"` (Cairo local).
+
+**`suboptimal_order`** / **`ineffective_bundling`** come from one truck
+distance matrix over terminal + drops (2–7 drops), with real one-way returns.
 
 ### 5.3 `POST /trip-audit/matches/:id/review` — body `{ "note": "..."? }`
 Marks the trip reviewed (sets `reviewed_at`).
@@ -268,3 +324,58 @@ Response (`ScanSummary`):
   "error": null
 }
 ```
+
+## 7. Service API (`/service`)
+
+Read-only lookups for other Apex services. Unlike `/admin/*` this surface
+has a stable contract, because other services depend on it.
+
+- **Auth:** an `X-Service-Token` header matching `SERVICE_READ_TOKEN`. No
+  JWT. When `SERVICE_READ_TOKEN` is unset, every `/service/*` route answers
+  `404`. A wrong or missing token gets `401`.
+- **Separate key on purpose:** `SERVICE_READ_TOKEN` is not `ADMIN_TOKEN`, so
+  a reader cannot rescan, clear caches or force an ETIT re-login.
+- Nothing under `/service` writes anything.
+
+### 7.1 `GET /service/trip-audit/driven-km?terminal=<name>&drop_off=<name>`
+
+How far our trucks actually drove one terminal → drop-off route. The fee
+lookup (falcon-fees) shows it next to the route's recorded km and truck-route km.
+
+**Source:** the trip audit's stored legs. A leg counts when it is a trip's
+**first** leg (`seq = 0`), is `outbound`, and ends at `drop_off`. That is one
+uninterrupted drive from the terminal geofence exit to the drop-off
+geofence entry. Excluded:
+
+- `between` legs, which start at the previous drop, not at the terminal.
+- `return` legs, which run the other way. One-way roads and time-of-day
+  bans make the reverse a different route.
+- Trips with a garage dwell on the way. The scan splits that outbound leg
+  at the garage, so no single leg is the route.
+
+**Matching names:** `terminal` matches the trip's own terminal text (the
+spelling `fee_mappings` uses) or the canonical terminal name, so a trip that
+names its terminal by an alias still counts. Names compare trimmed and
+case-insensitively. The route is physical, so trips of every company count.
+
+A leg starts and ends at geofence edges, so it reads a few hundred metres
+shorter than a gate-to-gate distance. That only matters on very short
+routes.
+
+```jsonc
+{
+  "terminal": "Alexandria",
+  "drop_off": "Tanta",
+  "trips": 18,                 // usable legs; 0 when none
+  "median_km": 124.3,          // the middle trip
+  "p10_km": 118.0,             // nearest-rank 10th / 90th percentile:
+  "p90_km": 131.2,             //   "most trips"; equals min / max with few trips
+  "road_matched": 15,          // of `trips`, how many were map-matched to roads
+                               //   (the rest are chord sums of GPS fixes)
+  "first_day": "2026-08-20",   // local trip days, YYYY-MM-DD
+  "latest_day": "2026-11-25"
+}
+```
+
+Every field is always present. With `trips: 0` the km and day fields are
+`null`. `400` if `terminal` or `drop_off` is missing or blank.

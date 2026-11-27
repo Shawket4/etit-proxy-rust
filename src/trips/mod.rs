@@ -1,22 +1,27 @@
 //! Trip audit: match apex parent trips against ETIT GPS history, compare
-//! each leg to the OSRM optimal route, and flag inefficiencies for review.
+//! each leg to the best legal truck route (Valhalla, at the leg's real
+//! departure time), and flag inefficiencies and banned-road use for review.
 //!
 //! Runs like the dead-zone scanner: a nightly pass over recent days plus an
 //! on-demand admin trigger, results persisted to SQLite and served to the
 //! dashboard via `/api/v1/trip-audit/*`.
 //!
 //! - [`pg`]        — read-only queries against the apex Postgres DB
-//! - [`osrm`]      — OSRM `/route` client with time-gate exclusion
+//! - [`bans_check`] — matched trace × time bans → banned-road episodes
+//! - [`drop_order`] — best delivery order + bundling check from one matrix
 //! - [`geo`]       — polyline decode + point-to-track distance
 //! - [`matcher`]   — geofence-based trip reconstruction and metrics
 //! - [`calibrate`] — GPS stop clustering → pin suggestions
+//! - [`driven`]    — driven km per terminal → drop-off, for the fee lookup
 //! - [`scan`]      — orchestration + nightly scheduler
 
+pub mod bans_check;
 pub mod calibrate;
+pub mod driven;
+pub mod drop_order;
 pub mod geo;
 pub mod journeys;
 pub mod matcher;
-pub mod osrm;
 pub mod pg;
 pub mod scan;
 
@@ -104,6 +109,8 @@ pub struct MatchedLeg {
     pub arrive_ts: i64,
     pub night_window: bool,
     pub actual_km: f64,
+    /// Best legal truck route for this leg (Valhalla). Named `osrm_*` for the
+    /// stored column and API field they feed, which predate the switch.
     pub osrm_km: Option<f64>,
     pub osrm_secs: Option<i64>,
     pub max_deviation_m: Option<f64>,

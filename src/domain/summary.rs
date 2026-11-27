@@ -6,9 +6,9 @@
 //! stops, and ignition events we already serve to the map — same window in,
 //! same numbers out, and the panel can never disagree with the drawn track.
 //!
-//! Distance comes from OSRM map-matching (road-snapped, immune to GPS
-//! scatter) with a raw haversine sum as fallback — the same
-//! `matched`/`chord` policy the trip audit uses.
+//! Distance is the teleport-filtered raw haversine sum (see
+//! `HistoryService::computed_summary` for why it is not map-matched); the
+//! `distance_method` field names which figure was used.
 
 use serde::Serialize;
 
@@ -33,7 +33,7 @@ pub struct ComputedSummary {
     /// Kilometres over the requested window. Road-snapped when
     /// `distance_method == "matched"`, chord-sum otherwise.
     pub mileage_km: f64,
-    /// "matched" (OSRM map-match) or "raw" (haversine sum fallback).
+    /// "matched" (road-snapped) or "raw" (haversine sum).
     pub distance_method: String,
     /// Fraction of pings the matcher accepted, when matched (0..100).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,8 +55,7 @@ pub struct ComputedSummary {
     pub to: Timestamp,
 }
 
-/// Everything except mileage/method, which need OSRM and are filled by the
-/// caller. Returns (partial summary, raw chord km) — the raw figure doubles
+/// Everything except mileage/method, which the caller fills in. Returns (partial summary, raw chord km) — the raw figure doubles
 /// as both the fallback mileage and the sanity band for the matched one.
 pub fn compute_metrics(
     points: &[HistoryPoint],

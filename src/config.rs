@@ -26,6 +26,11 @@ pub struct Config {
     pub bind_addr: String,
     /// Optional shared secret for `/admin/*`. None ⇒ admin routes disabled.
     pub admin_token: Option<String>,
+    /// Optional shared secret for the read-only `/service/*` surface that
+    /// other Apex services call (the fee lookup). Separate from
+    /// `admin_token` so a reader never holds the key that can rescan, clear
+    /// caches or log the ETIT session out. None ⇒ `/service/*` disabled.
+    pub service_read_token: Option<String>,
     /// CORS origins; `*` allows any.
     pub cors_origins: Vec<String>,
 
@@ -70,18 +75,22 @@ pub struct Config {
     /// Read-only connection to the apex Postgres DB (trips, fee mappings,
     /// canonical locations). None ⇒ trip audit disabled.
     pub apex_database_url: Option<String>,
-    /// OSRM routing endpoint, e.g. http://127.0.0.1:5000
-    pub osrm_url: String,
-    /// Excludable class for time-gated truck roads. Empty ⇒ never send an
-    /// exclude parameter (required while the dataset is still the plain car
-    /// profile, which has no such class).
-    pub osrm_exclude_class: String,
+    /// Valhalla routing endpoint, e.g. http://127.0.0.1:8002. All road
+    /// routing, map matching and distance matrices go through it.
+    pub valhalla_url: String,
+    /// `apex-time-bans.json` from `valhalla/build.sh`: the ways each ban
+    /// caught, so the audit can flag a truck that drove one while closed.
+    /// Unset or missing ⇒ no ban flags (routing still honours the bans, which
+    /// live in the tiles).
+    pub valhalla_time_bans: Option<std::path::PathBuf>,
+    /// The tanker every route is planned for (Valhalla truck costing).
+    pub truck: crate::routing::Truck,
     pub trip_scan_time: String,
     pub trip_scan_lookback_days: i64,
     pub trip_scan_on_startup: bool,
-    /// Fuel-tanker permit window (local time). Departures inside the window
-    /// may legally use the time-gated roads; departures outside it are
-    /// routed with `osrm_exclude_class` excluded.
+    /// Fuel-tanker permit window (local time), shown on each leg as
+    /// `night_window`. Routing no longer reads it: Valhalla applies the time
+    /// bans built into its tiles from each leg's real departure time.
     pub tanker_night_start: chrono::NaiveTime,
     pub tanker_night_end: chrono::NaiveTime,
     /// Default geofence radii in meters; per-location overrides come from
@@ -131,6 +140,11 @@ impl Config {
             std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
         let admin_token = std::env::var("ADMIN_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let service_read_token = std::env::var("SERVICE_READ_TOKEN")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -189,12 +203,25 @@ impl Config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let osrm_url = std::env::var("OSRM_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:5000".into())
+        let valhalla_url = std::env::var("VALHALLA_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8002".into())
             .trim_end_matches('/')
             .to_string();
-        let osrm_exclude_class =
-            std::env::var("OSRM_EXCLUDE_CLASS").unwrap_or_default().trim().to_string();
+        let valhalla_time_bans = std::env::var("VALHALLA_TIME_BANS")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let truck = crate::routing::Truck {
+            height_m: parse_or("TRUCK_HEIGHT_M", 4.0)?,
+            width_m: parse_or("TRUCK_WIDTH_M", 2.6)?,
+            length_m: parse_or("TRUCK_LENGTH_M", 16.5)?,
+            weight_t: parse_or("TRUCK_WEIGHT_T", 40.0)?,
+            axle_load_t: parse_or("TRUCK_AXLE_LOAD_T", 10.0)?,
+            axle_count: parse_or("TRUCK_AXLE_COUNT", 5)?,
+            hazmat: parse_or("TRUCK_HAZMAT", true)?,
+            top_speed_kmh: parse_or("TRUCK_TOP_SPEED_KMH", 90)?,
+        };
 
         let trip_scan_time = std::env::var("TRIP_SCAN_TIME").unwrap_or_else(|_| "04:45".into());
         if chrono::NaiveTime::parse_from_str(&trip_scan_time, "%H:%M").is_err() {
@@ -210,7 +237,7 @@ impl Config {
         let dropoff_radius_m = parse_or("DROPOFF_RADIUS_M", 300.0_f64)?;
 
         let trip_flag_distance_ratio = parse_or("TRIP_FLAG_DISTANCE_RATIO", 1.2_f64)?;
-        // Trucks run well below OSRM's modeled speeds; 2.5× filters to real
+        // Trucks run below even the capped truck speeds the router models; 2.5× filters to real
         // outliers instead of flagging every trip.
         let trip_flag_duration_ratio = parse_or("TRIP_FLAG_DURATION_RATIO", 2.5_f64)?;
         let trip_pending_closer_secs = parse_or("TRIP_PENDING_CLOSER_SECS", 3600_u64)?;
@@ -247,6 +274,7 @@ impl Config {
             etit_staff_id,
             bind_addr,
             admin_token,
+            service_read_token,
             cors_origins,
             database_url,
             timezone,
@@ -268,8 +296,9 @@ impl Config {
             zone_min_dwell_secs,
             zone_visit_gap_secs,
             apex_database_url,
-            osrm_url,
-            osrm_exclude_class,
+            valhalla_url,
+            valhalla_time_bans,
+            truck,
             trip_scan_time,
             trip_scan_lookback_days,
             trip_scan_on_startup,

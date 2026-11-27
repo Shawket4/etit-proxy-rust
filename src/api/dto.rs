@@ -16,7 +16,7 @@ pub struct HistoryQuery {
     pub refresh: Option<bool>,
     /// "msgpack" for a MessagePack body; anything else (or absent) is JSON.
     pub format: Option<String>,
-    /// "optimal" attaches each leg's OSRM-optimal polyline.
+    /// "optimal" attaches each leg's optimal-route polyline (stored as `osrm_geometry`).
     pub include: Option<String>,
 }
 
@@ -69,13 +69,12 @@ pub struct UnblockResponse {
     pub body_excerpt: Option<String>,
 }
 
-/// `POST /admin/routing/route` — one routed leg.
+/// `POST /admin/routing/route` — one routed leg, for a truck.
 ///
-/// Exists so other services stop talking to OSRM directly. FalconGo used to
-/// build its own `/route/v1/driving` URL for fee-mapping enrichment, which
-/// meant it never applied the time-gated exclude this service applies, and the
-/// two produced different distances for the same pair of points. One caller,
-/// one rule.
+/// The one place other services ask "how far is A from B by road" (FalconGo's
+/// fee mappings and trip summaries, the advisor). Routed by Valhalla for the
+/// configured tanker, so every caller gets the same truck rules and the same
+/// time-of-day bans.
 #[derive(Debug, Deserialize)]
 pub struct RouteRequest {
     pub from_lat: f64,
@@ -85,10 +84,12 @@ pub struct RouteRequest {
     /// Intermediate waypoints, in order.
     #[serde(default)]
     pub via: Vec<[f64; 2]>,
-    /// Whether the time-gated truck roads must be excluded — i.e. whether the
-    /// vehicle is moving outside the tanker permit window. Defaults to true,
-    /// which is the conservative reading: a route that avoids restricted roads
-    /// is legal at any hour, whereas one that uses them is not.
+    /// When the truck leaves (RFC 3339). Time bans apply as they would then.
+    #[serde(default)]
+    pub depart_at: Option<String>,
+    /// Without `depart_at`: true = must be legal at any hour (a stored
+    /// reference distance; avoids every time-banned road), false = leaving
+    /// now. Defaults to true, the conservative reading.
     #[serde(default = "default_restricted")]
     pub restricted: bool,
 }
@@ -106,4 +107,51 @@ pub struct RouteResponse {
     pub geometry: String,
     /// Echoed so a caller can record which rule produced the number.
     pub restricted: bool,
+    /// The departure the route was planned for: local "YYYY-MM-DDTHH:MM",
+    /// or "any_hour".
+    pub departure: String,
+    pub engine: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct LatLng {
+    pub lat: f64,
+    pub lng: f64,
+}
+
+/// `POST /admin/routing/optimize` — visit `stops` in the best order.
+#[derive(Debug, Deserialize)]
+pub struct OptimizeRequest {
+    pub start: LatLng,
+    pub stops: Vec<LatLng>,
+    /// Where the trip ends; defaults to `start` (a round trip).
+    #[serde(default)]
+    pub end: Option<LatLng>,
+    #[serde(default)]
+    pub depart_at: Option<String>,
+    #[serde(default = "default_restricted")]
+    pub restricted: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizedLeg {
+    pub distance_km: f64,
+    pub duration_min: f64,
+    pub geometry: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizeResponse {
+    /// Indices into `stops`, in visiting order.
+    pub order: Vec<usize>,
+    /// start → first stop, …, last stop → end.
+    pub legs: Vec<OptimizedLeg>,
+    pub distance_km: f64,
+    pub duration_min: f64,
+    /// The whole trip, polyline5.
+    pub geometry: String,
+    pub departure: String,
+    pub engine: &'static str,
 }

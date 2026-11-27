@@ -2,7 +2,7 @@
 //!
 //! Pure and synchronous: given GPS points/stops and a planned trip, detect
 //! the terminal departure, the drop-off visit sequence, and the (optional)
-//! return leg. OSRM comparison happens afterwards in `scan.rs` — this module
+//! return leg. Route comparison (Valhalla) happens afterwards in `scan.rs` — this module
 //! never does I/O, which keeps it unit-testable.
 //!
 //! Key behaviors:

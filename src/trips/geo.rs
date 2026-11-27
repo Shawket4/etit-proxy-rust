@@ -3,8 +3,18 @@
 
 use crate::zones::geo::haversine_m;
 
-/// Decode a precision-5 encoded polyline (Google / OSRM `geometries=polyline`).
+/// Decode a precision-5 encoded polyline (Google's format). Every geometry
+/// this service stores or serves is precision 5.
 pub fn decode_polyline(encoded: &str) -> Vec<(f64, f64)> {
+    decode_polyline_with(encoded, 1e5)
+}
+
+/// Decode a precision-6 encoded polyline: Valhalla's `shape`.
+pub fn decode_polyline6(encoded: &str) -> Vec<(f64, f64)> {
+    decode_polyline_with(encoded, 1e6)
+}
+
+fn decode_polyline_with(encoded: &str, factor: f64) -> Vec<(f64, f64)> {
     let bytes = encoded.as_bytes();
     let mut out = Vec::new();
     let (mut i, mut lat, mut lng) = (0usize, 0i64, 0i64);
@@ -34,7 +44,7 @@ pub fn decode_polyline(encoded: &str) -> Vec<(f64, f64)> {
         let Some(dlng) = read_varint(&mut i) else { break };
         lat += dlat;
         lng += dlng;
-        out.push((lat as f64 / 1e5, lng as f64 / 1e5));
+        out.push((lat as f64 / factor, lng as f64 / factor));
     }
     out
 }
@@ -115,6 +125,17 @@ mod tests {
         assert!((pts[0].1 - -120.2).abs() < 1e-9);
         assert!((pts[2].0 - 43.252).abs() < 1e-9);
         assert!((pts[2].1 - -126.453).abs() < 1e-9);
+    }
+
+    #[test]
+    fn precision6_reads_the_same_string_ten_times_finer() {
+        // The same bytes at 1e6: every coordinate is a tenth of the 1e5 reading.
+        let p5 = decode_polyline("_p~iF~ps|U_ulLnnqC_mqNvxq`@");
+        let p6 = decode_polyline6("_p~iF~ps|U_ulLnnqC_mqNvxq`@");
+        assert_eq!(p5.len(), p6.len());
+        for (a, b) in p5.iter().zip(&p6) {
+            assert!((a.0 / 10.0 - b.0).abs() < 1e-9 && (a.1 / 10.0 - b.1).abs() < 1e-9);
+        }
     }
 
     #[test]

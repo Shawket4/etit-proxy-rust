@@ -1,0 +1,29 @@
+{
+  "_comment": "Roads closed to Apex tankers, written into the OSM extract before Valhalla builds its tiles. A ban with \"always\": true becomes hgv=no (closed at every hour); one with banned_from/banned_to becomes hgv:conditional, which Valhalla applies from each trip's real departure time (Africa/Cairo local hours). Owner's rules, 2026-11-27: 26th of July and the Ahmed Hamdi tunnels are closed at all hours; the Cairo Ring Road is open at all hours and is deliberately absent.",
+  "bans": [
+    {
+      "id": "26th-of-july",
+      "label": "26th of July corridor",
+      "label_ar": "محور 26 يوليو",
+      "always": true,
+      "name_contains": ["26 يوليو", "٢٦ يوليو", "26th of july", "26th july", "26 july", "26 of july"],
+      "name_keys": ["name", "name:ar", "name:en"],
+      "highway": ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+                  "secondary", "secondary_link", "tertiary", "tertiary_link"],
+      "within_bbox": [30.80, 29.75, 31.65, 30.30]
+    },
+    {
+      "id": "ahmed-hamdi-tunnel",
+      "label": "Ahmed Hamdi tunnel",
+      "label_ar": "نفق الشهيد أحمد حمدي",
+      "always": true,
+      "_comment": "Both tunnels under the canal at Suez: the original and the northern one (Ahmed Hamdi 2). Only the tunnel ways: the approach roads share the name and stay open.",
+      "name_contains": ["احمد حمدى", "احمد حمدي", "أحمد حمدي", "أحمد حمدى", "ahmed hamdy", "ahmed hamdi"],
+      "name_keys": ["name", "name:ar", "name:en"],
+      "highway": ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link",
+                  "secondary", "secondary_link"],
+      "tags": {"tunnel": ["yes"]},
+      "within_bbox": [32.40, 29.90, 32.70, 30.20]
+    }
+  ]
+}

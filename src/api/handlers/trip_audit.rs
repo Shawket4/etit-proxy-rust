@@ -76,7 +76,7 @@ pub struct SummaryResponse {
     #[serde(flatten)]
     pub totals: crate::db::trip_audit::MatchSummaryRow,
     /// sum(osrm) / sum(actual) over compared trips, percent. None until at
-    /// least one trip has an OSRM comparison.
+    /// least one trip has a route comparison.
     pub efficiency_pct: Option<f64>,
     pub excess_km: f64,
     pub worst_routes: Vec<crate::db::trip_audit::WorstRouteRow>,

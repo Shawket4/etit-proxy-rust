@@ -9,6 +9,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 
 use crate::trips::calibrate::Suggestion;
+use crate::trips::driven::DrivenLeg;
 use crate::trips::{TripScanSummary};
 
 #[derive(Clone)]
@@ -26,7 +27,7 @@ pub struct MatchSummaryRow {
     pub critical: i64,
     pub flagged_unreviewed: i64,
     pub actual_km: f64,
-    /// Actual km restricted to trips that have an OSRM comparison — the
+    /// Actual km restricted to trips that have a route comparison — the
     /// honest denominator-mate for `osrm_km` when computing efficiency.
     pub actual_km_compared: f64,
     pub osrm_km: f64,
@@ -392,6 +393,49 @@ impl TripAuditRepo {
 
         tx.commit().await?;
         Ok(match_id)
+    }
+
+    /// Outbound legs that drove `terminal` → `drop_off` directly, for the fee
+    /// lookup's driven km (see [`crate::trips::driven`]).
+    ///
+    /// The leg must be the trip's first (`seq = 0`): that is the one that
+    /// leaves the terminal. A garage dwell splits it into terminal → garage
+    /// and garage → drop-off, and the second half carries the trip's terminal
+    /// name too, so without this it would pass as a direct drive.
+    ///
+    /// The terminal matches either the trip's own terminal text
+    /// (`trip_matches.terminal_name`, the spelling fee_mappings uses too) or
+    /// the canonical name the leg starts from, which differ when a trip names
+    /// its terminal by an alias. Names compare trimmed and case-insensitively;
+    /// SQLite's `lower` folds ASCII only, which is all the case these names have.
+    pub async fn outbound_legs_for_route(
+        &self,
+        terminal: &str,
+        drop_off: &str,
+    ) -> Result<Vec<DrivenLeg>> {
+        let rows: Vec<(f64, String, String)> = sqlx::query_as(
+            r#"SELECT l.actual_km, m.day_local, l.distance_method
+                 FROM trip_match_legs l
+                 JOIN trip_matches m ON m.id = l.match_id
+                WHERE l.leg_type = 'outbound'
+                  AND l.seq = 0
+                  AND lower(trim(l.to_name)) = lower(trim(?1))
+                  AND (lower(trim(l.from_name))      = lower(trim(?2))
+                    OR lower(trim(m.terminal_name))  = lower(trim(?2)))"#,
+        )
+        .bind(drop_off)
+        .bind(terminal)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(km, day_local, method)| DrivenLeg {
+                km,
+                day_local,
+                road_matched: method == "matched",
+            })
+            .collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -831,5 +875,170 @@ impl TripAuditRepo {
         .bind(since_day)
         .fetch_all(&self.pool)
         .await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    async fn repo() -> TripAuditRepo {
+        // One connection: every `:memory:` connection is its own database.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        TripAuditRepo::new(pool)
+    }
+
+    fn new_match<'a>(run: i64, parent: i64, day: &'a str, terminal_text: &'a str) -> NewMatch<'a> {
+        NewMatch {
+            scan_run_id: run,
+            parent_trip_id: parent,
+            day_local: day,
+            company: "Watanya",
+            terminal_name: terminal_text,
+            car_no_plate: "123",
+            vehicle_id: None,
+            driver_name: None,
+            status: "matched",
+            unmatched_reason: None,
+            start_ts: None,
+            end_ts: None,
+            returned_to_terminal: true,
+            deliveries_expected: 1,
+            deliveries_visited: 1,
+            actual_km: None,
+            osrm_km: None,
+            expected_km: None,
+            actual_secs: None,
+            osrm_secs: None,
+            distance_ratio: None,
+            duration_ratio: None,
+        }
+    }
+
+    fn new_leg<'a>(seq: i64, leg_type: &'a str, from: &'a str, to: &'a str, km: f64, method: &'a str) -> NewLeg<'a> {
+        NewLeg {
+            seq,
+            leg_type,
+            from_name: from,
+            to_name: to,
+            depart_ts: "2026-09-01T06:00:00Z".into(),
+            arrive_ts: "2026-09-01T08:00:00Z".into(),
+            night_window: false,
+            actual_km: km,
+            osrm_km: None,
+            actual_secs: 7200,
+            osrm_secs: None,
+            distance_ratio: None,
+            max_deviation_m: None,
+            actual_geometry: "",
+            osrm_geometry: "",
+            distance_method: method,
+            off_route_pct: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_direct_outbound_legs_on_the_route_count() {
+        let r = repo().await;
+        let run = r.insert_scan_run().await.unwrap();
+
+        // 1. Terminal -> Tanta directly, then on to Kafr, then back.
+        r.store_match(
+            &new_match(run, 1, "2026-09-01", "Alexandria"),
+            &[
+                new_leg(0, "outbound", "Alexandria", "Tanta", 120.0, "matched"),
+                new_leg(1, "between", "Tanta", "Kafr", 30.0, "matched"),
+                new_leg(2, "return", "Kafr", "Alexandria", 140.0, "matched"),
+            ],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        // 2. Tanta reached from another drop: a `between` leg, not the route.
+        r.store_match(
+            &new_match(run, 2, "2026-09-02", "Alexandria"),
+            &[
+                new_leg(0, "outbound", "Alexandria", "Kafr", 90.0, "matched"),
+                new_leg(1, "between", "Kafr", "Tanta", 35.0, "matched"),
+            ],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        // 3. A garage dwell split the outbound: neither half is the route.
+        r.store_match(
+            &new_match(run, 3, "2026-09-03", "Alexandria"),
+            &[
+                new_leg(0, "outbound", "Alexandria", "garage", 10.0, "chord"),
+                new_leg(1, "garage", "garage", "garage", 0.0, "chord"),
+                new_leg(2, "outbound", "garage", "Tanta", 115.0, "chord"),
+            ],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        // 4. Same route again, chord distance, different case and spacing.
+        r.store_match(
+            &new_match(run, 4, "2026-09-04", "Alexandria"),
+            &[new_leg(0, "outbound", "ALEXANDRIA ", "tanta", 124.0, "chord")],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let legs = r.outbound_legs_for_route(" alexandria", "Tanta ").await.unwrap();
+        let mut kms: Vec<f64> = legs.iter().map(|l| l.km).collect();
+        kms.sort_by(|a, b| a.total_cmp(b));
+        assert_eq!(kms, vec![120.0, 124.0]);
+        assert_eq!(legs.iter().filter(|l| l.road_matched).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_trip_naming_its_terminal_by_an_alias_still_counts() {
+        let r = repo().await;
+        let run = r.insert_scan_run().await.unwrap();
+        // The trip (and so fee_mappings) says "Mostorod Depot"; the leg
+        // starts from the canonical terminal name.
+        r.store_match(
+            &new_match(run, 7, "2026-10-10", "Mostorod Depot"),
+            &[new_leg(0, "outbound", "Mostorod", "Banha", 48.0, "matched")],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(r.outbound_legs_for_route("Mostorod Depot", "Banha").await.unwrap().len(), 1);
+        assert_eq!(r.outbound_legs_for_route("Mostorod", "Banha").await.unwrap().len(), 1);
+        assert!(r.outbound_legs_for_route("Suez", "Banha").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rescanned_trip_is_counted_once() {
+        let r = repo().await;
+        let run = r.insert_scan_run().await.unwrap();
+        for km in [100.0, 101.0] {
+            r.store_match(
+                &new_match(run, 9, "2026-11-01", "Alexandria"),
+                &[new_leg(0, "outbound", "Alexandria", "Tanta", km, "matched")],
+                &[],
+                &[],
+            )
+            .await
+            .unwrap();
+        }
+        let legs = r.outbound_legs_for_route("Alexandria", "Tanta").await.unwrap();
+        assert_eq!(legs.len(), 1);
+        assert_eq!(legs[0].km, 101.0);
     }
 }
