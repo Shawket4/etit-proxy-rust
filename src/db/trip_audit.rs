@@ -79,6 +79,7 @@ pub struct TripMatchRow {
 /// One stored leg, as a drive the fee lookup's map draws.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct LegDrive {
+    pub id: i64,
     pub actual_km: f64,
     pub day_local: String,
     pub depart_ts: String,
@@ -481,18 +482,25 @@ impl TripAuditRepo {
             .collect())
     }
 
-    /// One leg as a drive to draw: km, day, times and its matched shape.
-    pub async fn leg_drive(&self, leg_id: i64) -> Result<Option<LegDrive>> {
-        Ok(sqlx::query_as(
-            r#"SELECT l.actual_km, m.day_local, l.depart_ts, l.arrive_ts,
-                      l.actual_secs, l.actual_geometry
-                 FROM trip_match_legs l
-                 JOIN trip_matches m ON m.id = l.match_id
-                WHERE l.id = ?1"#,
-        )
-        .bind(leg_id)
-        .fetch_optional(&self.pool)
-        .await?)
+    /// Legs as drives to draw (km, day, times, matched shape), by id. Ids
+    /// with no row are absent from the map.
+    pub async fn leg_drives(&self, leg_ids: &[i64]) -> Result<std::collections::HashMap<i64, LegDrive>> {
+        if leg_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let placeholders = vec!["?"; leg_ids.len()].join(",");
+        let sql = format!(
+            "SELECT l.id, l.actual_km, m.day_local, l.depart_ts, l.arrive_ts, \
+                    l.actual_secs, l.actual_geometry \
+               FROM trip_match_legs l \
+               JOIN trip_matches m ON m.id = l.match_id \
+              WHERE l.id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, LegDrive>(&sql);
+        for id in leg_ids {
+            q = q.bind(id);
+        }
+        Ok(q.fetch_all(&self.pool).await?.into_iter().map(|d| (d.id, d)).collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1097,10 +1105,12 @@ mod tests {
         assert_eq!(c.len(), 1, "a chord-sum leg and a leg without a shape are not drawable");
         assert_eq!(c[0].km, 541.7);
 
-        let d = r.leg_drive(c[0].id).await.unwrap().unwrap();
+        let drives = r.leg_drives(&[c[0].id, -1]).await.unwrap();
+        assert_eq!(drives.len(), 1, "an unknown id is simply absent");
+        let d = &drives[&c[0].id];
         assert_eq!((d.day_local.as_str(), d.actual_secs), ("2026-11-20", 7200));
         assert_eq!(d.actual_geometry, "_p~iF~ps|U_ulLnnqC");
-        assert!(r.leg_drive(-1).await.unwrap().is_none());
+        assert!(r.leg_drives(&[]).await.unwrap().is_empty());
     }
 
     #[tokio::test]

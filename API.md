@@ -387,15 +387,19 @@ Two drives of one route for the fee lookup's map, both on the road network:
 - **`truck_route`**: Valhalla's best route for the configured tanker between
   the two pins. It must be legal at any hour, so closed roads are avoided.
   It is `null` when no pins are sent or Valhalla cannot route.
-- **`best_trip`**: the shortest real drive our trucks made. The candidates
-  are the route's road-matched outbound legs (the same legs as §7.1, minus
-  chord sums), and the shape is Valhalla's map match of the truck's GPS.
-  - A reading shorter than `min_share` (0.8) of a reference is a GPS gap:
-    the matched shape bridges the gap with a straight line. Such readings
-    are counted in `set_aside` and never shown as the best.
-  - The reference is the shorter of the truck route and the 75th-percentile
-    trip.
-  - `best_trip` is `null` when no reading clears the floor.
+- **`best_trip`**: the shortest **whole** drive our trucks made. The
+  candidates are the route's road-matched outbound legs (the same legs as
+  §7.1, minus chord sums), and the shape is Valhalla's map match of the
+  truck's GPS. A reading is not whole when:
+  - it is shorter than `min_share` (0.8) of the shorter of the truck route
+    and the 75th-percentile trip; or
+  - its shape has a straight segment over 5 km (a GPS gap bridged by a
+    line); or
+  - with pins sent, its shape starts or ends more than 10 km from them (the
+    tracker came online part-way).
+
+  Readings shorter than the best that fail any of these are counted in
+  `set_aside`. `best_trip` is `null` when no whole drive is found.
 
 The pins are optional, but send all four or none (`400` otherwise).
 
