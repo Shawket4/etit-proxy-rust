@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test for an Apex Valhalla instance (tiles from build.sh).
 #
-#   VALHALLA_URL=http://127.0.0.1:8002 ./test.sh [apex-time-bans.json]
+#   VALHALLA_URL=http://127.0.0.1:8002 ./test.sh [apex-time-bans.json [apex-road-names.json]]
 #
 # Exits non-zero if any check fails. Needs curl + python3. deploy.sh runs it
 # against the new tiles before they go live, and again after the swap.
@@ -9,6 +9,7 @@
 set -uo pipefail
 URL="${VALHALLA_URL:-http://127.0.0.1:8002}"
 BANS="${1:-}"
+NAMES="${2:-}"
 FAIL=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; FAIL=1; }
@@ -115,6 +116,38 @@ if [ -n "$BANS" ]; then
     [ "$hits" = "0" ] && pass "$a->$b ($t): no closed way on the route (${km} km)" \
       || fail "$a->$b ($t): route drives ${hits} closed ways (${km} km)"
   done
+fi
+
+# English road names (etit-proxy's road lists): the file reads, and the major
+# roads of a real route are in it. A release from before the names file
+# (a rollback target) has none: skipped, not failed.
+if [ -n "$NAMES" ]; then
+  if [ ! -f "$NAMES" ]; then
+    echo "SKIP: no road names file at $NAMES (a release from before it)"
+  else
+    r=$(python3 - "$URL" "$NAMES" "$SUEZ" "$BADR" "$TRUCK" <<'PY'
+import json, sys, urllib.request
+url, path, a, b, truck = sys.argv[1:]
+def post(ep, body):
+    req = urllib.request.Request(f"{url}/{ep}", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    return json.load(urllib.request.urlopen(req, timeout=60))
+loc = lambda s: dict(zip(("lat", "lon"), map(float, s.split(","))))
+try:
+    names = json.load(open(path))["names"]
+    r = post("route", {"locations": [loc(a), loc(b)], "costing": "truck", "costing_options": json.loads(truck), "units": "kilometers"})
+    t = post("trace_attributes", {"encoded_polyline": r["trip"]["legs"][0]["shape"], "shape_match": "edge_walk", "costing": "auto",
+                                  "filters": {"attributes": ["edge.way_id", "edge.length"], "action": "include"}})
+    km = sum(e["length"] for e in t["edges"] if str(e.get("way_id")) in names)
+    print(f"{len(names)} {km:.1f}")
+except Exception as e:
+    print(f"ERR {e}")
+PY
+)
+    read -r n km <<<"$r"
+    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 1000 ] && python3 -c "exit(0 if float('$km') > 20 else 1)" 2>/dev/null; then
+      pass "road names file: $n English names; ${km} km of Suez->Badr have one"
+    else fail "road names file $NAMES: $r"; fi
+  fi
 fi
 
 echo

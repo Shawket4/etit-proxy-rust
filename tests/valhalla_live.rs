@@ -4,6 +4,7 @@
 //!
 //!   VALHALLA_URL=http://127.0.0.1:18002 \
 //!   VALHALLA_TIME_BANS=~/work/valhalla-build/out/apex-time-bans.json \
+//!   VALHALLA_ROAD_NAMES=~/work/valhalla-build/out/apex-road-names.json \
 //!   cargo test --test valhalla_live -- --nocapture
 //!
 //! These check the behaviour the audit relies on, end to end: the roads
@@ -54,7 +55,8 @@ fn client() -> Option<RoutingClient> {
     let url = std::env::var("VALHALLA_URL").ok()?;
     let bans = std::env::var("VALHALLA_TIME_BANS").ok().map(std::path::PathBuf::from);
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().unwrap();
-    let c = RoutingClient::new(http, url, Truck::default(), TZ, bans);
+    let names = std::env::var("VALHALLA_ROAD_NAMES").ok().map(std::path::PathBuf::from);
+    let c = RoutingClient::new(http, url, Truck::default(), TZ, bans).with_road_names(names);
     assert!(!c.bans().is_empty(), "set VALHALLA_TIME_BANS to the build's apex-time-bans.json");
     Some(c)
 }
@@ -171,6 +173,11 @@ async fn somed_to_qena_takes_the_coast() {
     let roads = c.roads(&r.geometry).await.unwrap();
     assert!(roads.iter().any(|s| s.road_ref.as_deref() == Some("11")), "on road 11 down the coast");
     assert_eq!(roads.last().unwrap().road_ref.as_deref(), Some("244"), "into Qena on Qena-Safaga");
+    // With the build's names file (VALHALLA_ROAD_NAMES), English names too.
+    if !c.road_names().is_empty() {
+        println!("{:?}", roads.iter().map(|s| s.name_en.clone()).collect::<Vec<_>>());
+        assert!(roads.last().unwrap().name_en.as_deref().is_some_and(|n| n.contains("Qena")), "{:?}", roads.last());
+    }
 }
 
 /// The fee lookup's road list, on the busiest route: a handful of major

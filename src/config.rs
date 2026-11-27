@@ -83,6 +83,9 @@ pub struct Config {
     /// Unset or missing ⇒ no ban flags (routing still honours the bans, which
     /// live in the tiles).
     pub valhalla_time_bans: Option<std::path::PathBuf>,
+    /// `apex-road-names.json` from `valhalla/build.sh`: `name:en` by way id,
+    /// for the fee lookup's road lists. Unset or missing ⇒ Arabic names only.
+    pub valhalla_road_names: Option<std::path::PathBuf>,
     /// The tanker every route is planned for (Valhalla truck costing).
     pub truck: crate::routing::Truck,
     pub trip_scan_time: String,
@@ -212,6 +215,11 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from);
+        let valhalla_road_names = std::env::var("VALHALLA_ROAD_NAMES")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
         let truck = crate::routing::Truck {
             height_m: parse_or("TRUCK_HEIGHT_M", 4.0)?,
             width_m: parse_or("TRUCK_WIDTH_M", 2.6)?,
@@ -298,6 +306,7 @@ impl Config {
             apex_database_url,
             valhalla_url,
             valhalla_time_bans,
+            valhalla_road_names,
             truck,
             trip_scan_time,
             trip_scan_lookback_days,

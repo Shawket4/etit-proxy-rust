@@ -76,6 +76,33 @@ The Cairo Ring Road is open at all hours. With the tunnels closed, trucks for
 South Sinai cross further north (Suez → Ras Sudr goes from 84 km to the
 detour `test.sh` prints).
 
+## English road names
+
+Valhalla serves each road under its default-language name, which in Egypt is
+the Arabic `name`, and has no request option for `name:en` (3.9.3, tested
+2026-11-27). The fee lookup's road lists want the English name in the English
+UI, and OpenStreetMap has one on most major roads. So the build exports them:
+
+- `valhalla/export_road_names.py` writes `apex-road-names.json`: `name:en` by
+  way id, for every motorway–tertiary way (and link) that has one (about
+  26,000 ways, 1 MB). It reads the same extract the tiles come from, so the way
+  ids match the edges Valhalla returns. `build.sh` runs it; `deploy.sh` ships
+  and checksums it; `test.sh` checks it reads and covers a real route.
+- etit-proxy reads it from `VALHALLA_ROAD_NAMES`
+  (`/opt/valhalla/current/apex-road-names.json`), looks each road-list edge's
+  way id up, and adds `name_en` to the stretch. It re-reads the file when it
+  changes, so a Valhalla deploy needs no etit-proxy restart. Missing file:
+  Arabic names only, nothing fails.
+
+To refresh the names alone (same extract, tiles unchanged):
+
+```sh
+~/work/valhalla-venv/bin/python valhalla/export_road_names.py \
+  ~/work/valhalla-build/egypt-latest.osm.pbf ~/work/valhalla-build/out/apex-road-names.json
+```
+
+then `deploy.sh` as below (unchanged files are hard-linked on the VPS).
+
 ## Build (on a workstation, never the VPS)
 
 ```sh
@@ -94,8 +121,10 @@ and `deploy.sh` runs exactly that digest on the VPS.
 ```sh
 sudo docker run -d --rm --name apex-valhalla-local -p 127.0.0.1:18002:8002 \
   -v ~/work/valhalla-build/out:/data <digest from BUILD_INFO> valhalla_service /data/valhalla.json 2
-VALHALLA_URL=http://127.0.0.1:18002 ./test.sh ~/work/valhalla-build/out/apex-time-bans.json
+VALHALLA_URL=http://127.0.0.1:18002 ./test.sh ~/work/valhalla-build/out/apex-time-bans.json \
+  ~/work/valhalla-build/out/apex-road-names.json
 VALHALLA_URL=http://127.0.0.1:18002 VALHALLA_TIME_BANS=~/work/valhalla-build/out/apex-time-bans.json \
+  VALHALLA_ROAD_NAMES=~/work/valhalla-build/out/apex-road-names.json \
   cargo test --test valhalla_live -- --nocapture
 ```
 
@@ -123,6 +152,7 @@ throwaway container. It then flips `/opt/valhalla/current` and restarts
      ```
      VALHALLA_URL=http://127.0.0.1:8002
      VALHALLA_TIME_BANS=/opt/valhalla/current/apex-time-bans.json
+     VALHALLA_ROAD_NAMES=/opt/valhalla/current/apex-road-names.json
      ```
    - then deploy etit-proxy.
 3. **FalconGo:** deploy the release whose trip summaries call

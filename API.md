@@ -427,7 +427,8 @@ Each stretch:
 
 | field | |
 |---|---|
-| `name` | OSM name as mapped (Arabic in Egypt; this Valhalla build serves no `name:en`). `null` for an unnamed road and for local streets |
+| `name` | OSM name as mapped (Arabic in Egypt). `null` for an unnamed road and for local streets |
+| `name_en` | the same road's OSM `name:en`, from the build's `apex-road-names.json` (`VALHALLA_ROAD_NAMES`; Valhalla itself serves only the Arabic name). `null` where OSM has none or the file is not configured |
 | `ref` | road number (`"11"`, `"244"`), or `null` |
 | `road_class` | Valhalla's class for most of the stretch: `motorway`, `trunk`, `primary`, `secondary`, `tertiary`, `unclassified`, `residential`, `service_other` |
 | `km` | including what it absorbed |
@@ -442,38 +443,28 @@ name; unnamed roads and local streets cannot be matched and are left out.
 "Much more" is at least 3 km and a quarter of the road's longer share.
 `best_more` / `truck_more` are sorted by the extra km; each entry has
 `name` (`null` for a numbered road whose sections carry several names),
-`ref`, `best_km` and `truck_km`. `null` unless both routes have `roads`.
+`name_en`, `ref`, `best_km` and `truck_km`. `null` unless both routes have
+`roads`.
 
 ```jsonc
 {
   "terminal": "Somed", "drop_off": "Qena",
-  "truck_route": { "distance_km": 695.4, "duration_min": 505.7,
+  "truck_route": { "distance_km": 542.9, "duration_min": 367.9,
                    "geometry": "<polyline5>", "departure": "any_hour",
                    "roads": [
-                     { "name": "طريق السويس, العين السخنه الجانبي", "ref": "11", "road_class": "primary",
-                       "km": 18.2, "from_index": 0, "to_index": 282 },
-                     { "name": "طريق العين السخنه", "ref": null, "road_class": "trunk",
-                       "km": 36.9, "from_index": 282, "to_index": 882 },
-                     // …
-                     { "name": "طريق اسيوط, قنا الزراعي", "ref": "25", "road_class": "trunk",
-                       "km": 144.9, "from_index": 6142, "to_index": 8030 } ] },
+                     { "name": "طريق العين السخنه, الزعفرانه", "name_en": "Ain Sokhna, Zaafarana Road",
+                       "ref": "11", "road_class": "trunk", "km": 66.4, "from_index": 0, "to_index": 1145 },
+                     // … three more sections of 11 …
+                     { "name": "طريق قنا, سفاجا", "name_en": "Qena, Safaga Road",
+                       "ref": "244", "road_class": "trunk", "km": 168.6, "from_index": 3239, "to_index": 6046 } ] },
   "best_trip":   { "km": 541.4, "drive_min": 1568.1,   // geofence exit to entry, stops included
                    "day": "2026-11-04", "depart_ts": "2026-11-04T14:32:55Z",
                    "arrive_ts": "2026-11-05T16:41:03Z", "geometry": "<polyline5>",
-                   "roads": [
-                     { "name": "طريق العين السخنه, الزعفرانه", "ref": "11", "road_class": "trunk",
-                       "km": 65.8, "from_index": 0, "to_index": 1127 },
-                     // … two more sections of 11 …
-                     { "name": "طريق الغردقة, سفاجا", "ref": "11", "road_class": "trunk",
-                       "km": 54.2, "from_index": 2684, "to_index": 3221 },
-                     { "name": "طريق قنا, سفاجا", "ref": "244", "road_class": "trunk",
-                       "km": 168.3, "from_index": 3221, "to_index": 6019 } ] },
+                   "roads": [ /* the same five roads: 65.8, 101.9, 151.8, 54.2, 168.3 km */ ] },
   "trips_considered": 583, "set_aside": 199, "min_share": 0.8,
-  "road_difference": {
-    "best_more":  [ { "name": null, "ref": "11", "best_km": 373.7, "truck_km": 18.2 },
-                    { "name": "طريق قنا, سفاجا", "ref": "244", "best_km": 168.3, "truck_km": 0.0 } ],
-    "truck_more": [ { "name": "طريق اسيوط, قنا الزراعي", "ref": "25", "best_km": 0.0, "truck_km": 144.9 },
-                    { "name": "طريق المنيا, الواسطى", "ref": null, "best_km": 0.0, "truck_km": 127.6 } ]
-  }
+  // Same roads: nothing to report. Before the shortest-route preference the
+  // truck route went inland and this read best_more: 11 (373.7 km) and 244;
+  // truck_more: 25, Minya–Wasta, Cairo–Aswan eastern desert, ….
+  "road_difference": { "best_more": [], "truck_more": [] }
 }
 ```

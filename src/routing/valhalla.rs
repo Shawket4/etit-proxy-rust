@@ -31,6 +31,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::bans::TimeBans;
+use super::names::EnglishNames;
 use super::roads::{self, RoadEdge, RoadStretch};
 use super::Truck;
 use crate::trips::geo::{decode_polyline, decode_polyline6};
@@ -117,6 +118,7 @@ pub struct RoutingClient {
     tz: chrono_tz::Tz,
     bans: Arc<ArcSwap<TimeBans>>,
     bans_path: Option<PathBuf>,
+    names: EnglishNames,
 }
 
 impl RoutingClient {
@@ -134,6 +136,7 @@ impl RoutingClient {
             tz,
             bans: Arc::new(ArcSwap::from_pointee(TimeBans::default())),
             bans_path,
+            names: EnglishNames::default(),
         };
         client.reload_bans();
         client
@@ -158,6 +161,17 @@ impl RoutingClient {
 
     pub fn bans(&self) -> Arc<TimeBans> {
         self.bans.load_full()
+    }
+
+    /// English road names for the road lists: `apex-road-names.json` from
+    /// the Valhalla build (`VALHALLA_ROAD_NAMES`). Re-read when it changes.
+    pub fn with_road_names(mut self, path: Option<PathBuf>) -> Self {
+        self.names = EnglishNames::new(path);
+        self
+    }
+
+    pub fn road_names(&self) -> Arc<super::names::RoadNames> {
+        self.names.current()
     }
 
     pub fn truck(&self) -> &Truck {
@@ -424,7 +438,7 @@ impl RoutingClient {
                 "units": "kilometers",
                 "filters": {
                     "attributes": [
-                        "edge.names", "edge.length", "edge.road_class", "edge.use",
+                        "edge.way_id", "edge.names", "edge.length", "edge.road_class", "edge.use",
                         "edge.roundabout", "edge.internal_intersection",
                         "edge.begin_shape_index", "edge.end_shape_index", "shape",
                     ],
@@ -439,7 +453,11 @@ impl RoutingClient {
                 self.post("trace_attributes", &body("map_snap")).await?
             }
         };
-        let (edges, trace) = parse_road_edges(&v)?;
+        let (mut edges, trace) = parse_road_edges(&v)?;
+        let english = self.names.current();
+        for e in &mut edges {
+            e.name_en = english.english(e.way_id).map(str::to_string);
+        }
         let mut stretches = roads::summarise(&edges);
         roads::reindex(&mut stretches, &trace, &served);
         Ok(stretches)
@@ -665,6 +683,8 @@ struct RoadTrace {
 #[derive(Deserialize)]
 struct RoadTraceEdge {
     #[serde(default)]
+    way_id: i64,
+    #[serde(default)]
     names: Vec<String>,
     #[serde(default)]
     length: f64,
@@ -695,7 +715,9 @@ pub(crate) fn parse_road_edges(v: &Value) -> Result<TracedRoads> {
         .edges
         .into_iter()
         .map(|e| RoadEdge {
+            way_id: e.way_id,
             names: e.names,
+            name_en: None,
             road_class: e.road_class,
             road_use: if e.road_use.is_empty() { "road".into() } else { e.road_use },
             junction: e.roundabout || e.internal_intersection,
@@ -956,7 +978,12 @@ mod tests {
                             axum::Json(json!({"error_code": 443, "error": "Exact route match algorithm failed to find path"})),
                         )
                     } else {
-                        (axum::http::StatusCode::OK, axum::Json(serde_json::from_str::<Value>(ROADS_TRACE).unwrap()))
+                        // The ring road's edges carry a way id the names file knows.
+                        let mut v = serde_json::from_str::<Value>(ROADS_TRACE).unwrap();
+                        for e in v["edges"].as_array_mut().unwrap().iter_mut().take(3) {
+                            e["way_id"] = json!(42);
+                        }
+                        (axum::http::StatusCode::OK, axum::Json(v))
                     }
                 }
             }),
@@ -965,10 +992,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let client = RoutingClient::new(reqwest::Client::new(), format!("http://{addr}"), Truck::default(), chrono_tz::Africa::Cairo, None);
+        let names = std::env::temp_dir().join(format!("roads-names-{}.json", std::process::id()));
+        std::fs::write(&names, r#"{"names":{"42":"The Regional Ring Road"}}"#).unwrap();
+        let client = RoutingClient::new(reqwest::Client::new(), format!("http://{addr}"), Truck::default(), chrono_tz::Africa::Cairo, None)
+            .with_road_names(Some(names.clone()));
         let s = client.roads(ROADS_ROUTE).await.unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].road_ref.as_deref(), Some("515"));
+        assert_eq!(s[0].name_en.as_deref(), Some("The Regional Ring Road"), "looked up by way id");
+        assert_eq!(s[1].name_en, None, "an unnamed road has no English name either");
+        let _ = std::fs::remove_file(names);
 
         let bodies = seen.lock().unwrap().clone();
         let tries: Vec<&str> = bodies.iter().map(|b| b["shape_match"].as_str().unwrap()).collect();
@@ -978,6 +1011,7 @@ mod tests {
         assert_eq!(sent.len(), served.len());
         assert!((sent[10].0 - served[10].0).abs() < 1e-9 && (sent[10].1 - served[10].1).abs() < 1e-9);
         assert_eq!(bodies[0]["costing_options"]["auto"]["ignore_closures"], true);
+        assert!(bodies[0]["filters"]["attributes"].as_array().unwrap().contains(&json!("edge.way_id")));
 
         assert!(client.roads("").await.is_err(), "no shape, no list");
     }
