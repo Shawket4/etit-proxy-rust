@@ -6,7 +6,7 @@
 #   VPS=... SSH_KEY=... ./deploy.sh --rollback
 #
 # VPS layout (created on first deploy):
-#   /opt/valhalla/releases/<stamp>/   one build: tiles tar, sqlite dbs, config, bans
+#   /opt/valhalla/releases/<stamp>/   one build: tiles tar, sqlite dbs, config, bans, names
 #   /opt/valhalla/current -> releases/<stamp>
 #   container apex-valhalla           127.0.0.1:8002, serves /opt/valhalla/current
 #
@@ -24,9 +24,11 @@
 #      point `current` back and restart.
 #   6. Keep the three newest releases.
 #
-# etit-proxy reads VALHALLA_URL=http://127.0.0.1:8002 and
-# VALHALLA_TIME_BANS=/opt/valhalla/current/apex-time-bans.json; it re-reads
-# the bans at every scan, so no etit-proxy restart is needed.
+# etit-proxy reads VALHALLA_URL=http://127.0.0.1:8002,
+# VALHALLA_TIME_BANS=/opt/valhalla/current/apex-time-bans.json and
+# VALHALLA_ROAD_NAMES=/opt/valhalla/current/apex-road-names.json; it re-reads
+# the bans at every scan and the names when the file changes, so no
+# etit-proxy restart is needed.
 #
 # A restart drops routing for the second or two the service takes to open
 # the tiles. Avoid the trip-audit scan time (TRIP_SCAN_TIME, 04:45 default).
@@ -81,7 +83,7 @@ ln -sfn "\$prev" current.new && mv -T current.new current
 docker restart "\$NAME" >/dev/null
 wait_ready "\$PORT" 120 || { echo "apex-valhalla did not come back" >&2; exit 1; }
 echo "current -> \$prev (was \$cur)"
-VALHALLA_URL=http://127.0.0.1:\$PORT bash current/test.sh current/apex-time-bans.json
+VALHALLA_URL=http://127.0.0.1:\$PORT bash current/test.sh current/apex-time-bans.json current/apex-road-names.json
 EOF
   exit 0
 fi
@@ -89,13 +91,13 @@ fi
 
 # ---------------------------------------------------------------- 1. local --
 echo "== 1. Local build in $OUT =="
-for f in valhalla_tiles.tar admins.sqlite timezones.sqlite valhalla.json apex-time-bans.json BUILD_INFO; do
+for f in valhalla_tiles.tar admins.sqlite timezones.sqlite valhalla.json apex-time-bans.json apex-road-names.json BUILD_INFO; do
   [ -s "$OUT/$f" ] || die "missing $OUT/$f: run build.sh first"
 done
 IMAGE="$(sed -n 's/^image=//p' "$OUT/BUILD_INFO")"
 [[ "$IMAGE" == *@sha256:* ]] || die "BUILD_INFO has no pinned image digest"
 cp "$SCRIPT_DIR/test.sh" "$OUT/test.sh"
-(cd "$OUT" && sha256sum valhalla_tiles.tar admins.sqlite timezones.sqlite valhalla.json apex-time-bans.json BUILD_INFO test.sh > SHA256SUMS)
+(cd "$OUT" && sha256sum valhalla_tiles.tar admins.sqlite timezones.sqlite valhalla.json apex-time-bans.json apex-road-names.json BUILD_INFO test.sh > SHA256SUMS)
 BYTES="$(du -cb "$OUT"/* | tail -1 | cut -f1)"
 echo "   $((BYTES / 1024 / 1024)) MiB, image $IMAGE"
 
@@ -139,7 +141,7 @@ $LIB
 docker rm -f apex-valhalla-candidate >/dev/null 2>&1 || true
 run_service apex-valhalla-candidate "\$CPORT" "\$REL" "\$IMAGE" 1 --rm
 ok=0
-if wait_ready "\$CPORT" 120 && VALHALLA_URL=http://127.0.0.1:\$CPORT bash "\$REL/test.sh" "\$REL/apex-time-bans.json"; then ok=1; fi
+if wait_ready "\$CPORT" 120 && VALHALLA_URL=http://127.0.0.1:\$CPORT bash "\$REL/test.sh" "\$REL/apex-time-bans.json" "\$REL/apex-road-names.json"; then ok=1; fi
 [ "\$ok" = 1 ] || docker logs --tail 30 apex-valhalla-candidate >&2 || true
 docker rm -f apex-valhalla-candidate >/dev/null 2>&1 || true
 [ "\$ok" = 1 ] || { echo "the new release failed its tests; nothing live changed (left in \$REL)" >&2; exit 1; }
@@ -160,7 +162,7 @@ else
   docker rm -f "\$NAME" >/dev/null 2>&1 || true
   run_service "\$NAME" "\$PORT" "\$ROOT/current" "\$IMAGE" "\$THREADS" --restart unless-stopped
 fi
-if wait_ready "\$PORT" 120 && VALHALLA_URL=http://127.0.0.1:\$PORT bash current/test.sh current/apex-time-bans.json; then
+if wait_ready "\$PORT" 120 && VALHALLA_URL=http://127.0.0.1:\$PORT bash current/test.sh current/apex-time-bans.json current/apex-road-names.json; then
   ls -d releases/* | sort | head -n -3 | xargs -r rm -rf
   echo "   live: current -> \$(readlink current)"
   cat current/BUILD_INFO

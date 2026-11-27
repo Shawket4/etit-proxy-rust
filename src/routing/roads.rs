@@ -46,8 +46,11 @@ pub fn min_km(total_km: f64) -> f64 {
 /// One edge of the route, as Valhalla's `trace_attributes` reports it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoadEdge {
+    pub way_id: i64,
     /// Valhalla's names: refs ("11", "TAH 4") and names together.
     pub names: Vec<String>,
+    /// The way's `name:en`, from the names file ([`super::names`]).
+    pub name_en: Option<String>,
     /// `motorway` … `tertiary`, `unclassified`, `residential`, `service_other`.
     pub road_class: String,
     /// `road`, `ramp`, `turn_channel`, `service_road`, …
@@ -66,6 +69,8 @@ pub struct RoadStretch {
     /// OSM name as mapped (Arabic in Egypt); null for a road with no name and
     /// for local roads.
     pub name: Option<String>,
+    /// The same road's `name:en` where OSM has one; null otherwise.
+    pub name_en: Option<String>,
     /// Road number ("11", "244"); null when the road has none.
     #[serde(rename = "ref")]
     pub road_ref: Option<String>,
@@ -123,6 +128,8 @@ impl Tally {
 struct Piece {
     kind: Kind,
     names: Tally,
+    /// English names, per Arabic spelling.
+    english: Vec<(String, Tally)>,
     refs: Tally,
     classes: Tally,
     km: f64,
@@ -142,6 +149,7 @@ impl Piece {
         let mut p = Piece {
             kind,
             names: Tally::default(),
+            english: Vec::new(),
             refs: Tally::default(),
             classes: Tally::default(),
             km: e.km.max(0.0),
@@ -157,6 +165,11 @@ impl Piece {
             }
             if let Some(n) = e.names.iter().map(|n| n.trim()).find(|n| !n.is_empty() && !is_ref(n)) {
                 p.names.add(n, p.km);
+                if let Some(en) = e.name_en.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    let mut t = Tally::default();
+                    t.add(en, p.km);
+                    p.english.push((n.to_string(), t));
+                }
             }
         }
         p
@@ -165,6 +178,12 @@ impl Piece {
     /// Another piece of the same road, after this one.
     fn join(&mut self, next: Piece) {
         self.names.merge(&next.names);
+        for (ar, en) in next.english {
+            match self.english.iter_mut().find(|(k, _)| *k == ar) {
+                Some((_, t)) => t.merge(&en),
+                None => self.english.push((ar, en)),
+            }
+        }
         self.refs.merge(&next.refs);
         self.classes.merge(&next.classes);
         self.km += next.km;
@@ -248,6 +267,13 @@ pub fn summarise(edges: &[RoadEdge]) -> Vec<RoadStretch> {
         .into_iter()
         .map(|p| RoadStretch {
             name: p.names.top().map(str::to_string),
+            // The English name of the spelling shown, not of what it absorbed.
+            name_en: p
+                .names
+                .top()
+                .and_then(|ar| p.english.iter().find(|(k, _)| k == ar))
+                .and_then(|(_, t)| t.top())
+                .map(str::to_string),
             road_ref: p.refs.top().map(str::to_string),
             road_class: p.classes.top().unwrap_or("").to_string(),
             km: round1(p.km),
@@ -316,6 +342,8 @@ pub struct RoadShare {
     /// The road's name; null for a numbered road whose sections carry
     /// several names (shown by its ref), or one with no name.
     pub name: Option<String>,
+    /// Its `name:en`, when `name` is set and OSM has one.
+    pub name_en: Option<String>,
     #[serde(rename = "ref")]
     pub road_ref: Option<String>,
     pub best_km: f64,
@@ -344,6 +372,7 @@ const DIFF_MIN_SHARE: f64 = 0.25;
 pub fn compare(best: &[RoadStretch], truck: &[RoadStretch]) -> RoadDifference {
     struct Road {
         names: Tally,
+        english: Tally,
         refs: Tally,
         best_km: f64,
         truck_km: f64,
@@ -361,7 +390,13 @@ pub fn compare(best: &[RoadStretch], truck: &[RoadStretch]) -> RoadDifference {
         let mut hits = roads.iter().enumerate().filter(|(_, r)| belongs(r)).map(|(i, _)| i).collect::<Vec<_>>();
         let at = match hits.first().copied() {
             None => {
-                roads.push(Road { names: Tally::default(), refs: Tally::default(), best_km: 0.0, truck_km: 0.0 });
+                roads.push(Road {
+                    names: Tally::default(),
+                    english: Tally::default(),
+                    refs: Tally::default(),
+                    best_km: 0.0,
+                    truck_km: 0.0,
+                });
                 roads.len() - 1
             }
             Some(first) => {
@@ -371,6 +406,7 @@ pub fn compare(best: &[RoadStretch], truck: &[RoadStretch]) -> RoadDifference {
                     let other = roads.remove(j);
                     let r = &mut roads[first];
                     r.names.merge(&other.names);
+                    r.english.merge(&other.english);
                     r.refs.merge(&other.refs);
                     r.best_km += other.best_km;
                     r.truck_km += other.truck_km;
@@ -381,6 +417,9 @@ pub fn compare(best: &[RoadStretch], truck: &[RoadStretch]) -> RoadDifference {
         let r = &mut roads[at];
         if let Some(n) = &s.name {
             r.names.add(n, s.km);
+        }
+        if let Some(en) = &s.name_en {
+            r.english.add(en, s.km);
         }
         if let Some(x) = &s.road_ref {
             r.refs.add(x, s.km);
@@ -400,9 +439,11 @@ pub fn compare(best: &[RoadStretch], truck: &[RoadStretch]) -> RoadDifference {
             }
         }
         let road_ref = r.refs.top().map(str::to_string);
+        // A numbered road with several section names is named by its ref.
+        let name = if distinct.len() > 1 && road_ref.is_some() { None } else { r.names.top().map(str::to_string) };
         RoadShare {
-            // A numbered road with several section names is named by its ref.
-            name: if distinct.len() > 1 && road_ref.is_some() { None } else { r.names.top().map(str::to_string) },
+            name_en: name.as_ref().and(r.english.top()).map(str::to_string),
+            name,
             road_ref,
             best_km: round1(r.best_km),
             truck_km: round1(r.truck_km),
@@ -543,7 +584,9 @@ mod tests {
             // A vertex every ~500 m.
             let n = ((km * 2.0).ceil() as usize).max(1);
             self.list.push(RoadEdge {
+                way_id: self.list.len() as i64 + 1,
                 names: names.iter().map(|s| s.to_string()).collect(),
+                name_en: None,
                 road_class: class.into(),
                 road_use: road_use.into(),
                 junction: false,
@@ -725,6 +768,31 @@ mod tests {
     }
 
     #[test]
+    fn the_english_name_is_that_of_the_spelling_shown() {
+        let mut e = Edges::new();
+        e.road(&["25", "طريق اسيوط, قنا الزراعي"], "trunk", 84.0)
+            .road(&["25", "طريق اسيوط, قنا الزراعى"], "trunk", 58.7)
+            .road(&["طريق قنا, سفاجا"], "trunk", 2.0);
+        e.list[0].name_en = Some("Asyout, Qena Agricultural Road".into());
+        e.list[1].name_en = Some("Asyout-Qena Agricultural Road".into());
+        e.list[2].name_en = Some("Qena, Safaga Road".into());
+        let s = summarise(&e.list);
+        assert_eq!(s.len(), 1, "the 2 km piece folds in");
+        assert_eq!(s[0].name_en.as_deref(), Some("Asyout, Qena Agricultural Road"), "not the absorbed road's");
+        let v = serde_json::to_value(&s[0]).unwrap();
+        assert_eq!(v["name_en"], "Asyout, Qena Agricultural Road");
+
+        let mut a = stretch(Some("طريق قنا, سفاجا"), Some("244"), 168.6);
+        a.name_en = Some("Qena, Safaga Road".into());
+        let d = compare(&[a], &[]);
+        assert_eq!(d.best_more[0].name_en.as_deref(), Some("Qena, Safaga Road"));
+        let mut b = stretch(Some("طريق أ"), Some("11"), 50.0);
+        b.name_en = Some("A Road".into());
+        let d = compare(&[b, stretch(Some("طريق ب"), Some("11"), 50.0)], &[]);
+        assert_eq!((d.best_more[0].name.as_deref(), d.best_more[0].name_en.as_deref()), (None, None), "named by its ref");
+    }
+
+    #[test]
     fn refs_are_numbers_and_names_are_not() {
         for r in ["11", "244", "TAH 4", "M1", "N-3", "١١", "25A"] {
             assert!(is_ref(r), "{r}");
@@ -751,9 +819,9 @@ mod tests {
         let served: Vec<(f64, f64)> = (0..=100).map(|i| (30.0, 31.0 + i as f64 * 0.01)).collect();
         let trace: Vec<(f64, f64)> = (0..=200).map(|i| (30.0, 31.0 + i as f64 * 0.005)).collect();
         let mut s = vec![
-            RoadStretch { name: None, road_ref: Some("1".into()), road_class: "trunk".into(), km: 1.0, from_index: 0, to_index: 60 },
-            RoadStretch { name: None, road_ref: Some("2".into()), road_class: "trunk".into(), km: 1.0, from_index: 60, to_index: 140 },
-            RoadStretch { name: None, road_ref: Some("3".into()), road_class: "trunk".into(), km: 1.0, from_index: 140, to_index: 199 },
+            RoadStretch { name: None, name_en: None, road_ref: Some("1".into()), road_class: "trunk".into(), km: 1.0, from_index: 0, to_index: 60 },
+            RoadStretch { name: None, name_en: None, road_ref: Some("2".into()), road_class: "trunk".into(), km: 1.0, from_index: 60, to_index: 140 },
+            RoadStretch { name: None, name_en: None, road_ref: Some("3".into()), road_class: "trunk".into(), km: 1.0, from_index: 140, to_index: 199 },
         ];
         reindex(&mut s, &trace, &served);
         let ranges: Vec<(usize, usize)> = s.iter().map(|x| (x.from_index, x.to_index)).collect();
@@ -769,9 +837,9 @@ mod tests {
         // The boundary is the turn-back point, then the start again.
         let trace = served.clone();
         let mut s = vec![
-            RoadStretch { name: None, road_ref: Some("1".into()), road_class: "trunk".into(), km: 1.0, from_index: 0, to_index: 50 },
-            RoadStretch { name: None, road_ref: Some("2".into()), road_class: "trunk".into(), km: 1.0, from_index: 50, to_index: 100 },
-            RoadStretch { name: None, road_ref: Some("3".into()), road_class: "trunk".into(), km: 1.0, from_index: 100, to_index: 120 },
+            RoadStretch { name: None, name_en: None, road_ref: Some("1".into()), road_class: "trunk".into(), km: 1.0, from_index: 0, to_index: 50 },
+            RoadStretch { name: None, name_en: None, road_ref: Some("2".into()), road_class: "trunk".into(), km: 1.0, from_index: 50, to_index: 100 },
+            RoadStretch { name: None, name_en: None, road_ref: Some("3".into()), road_class: "trunk".into(), km: 1.0, from_index: 100, to_index: 120 },
         ];
         reindex(&mut s, &trace, &served);
         let ranges: Vec<(usize, usize)> = s.iter().map(|x| (x.from_index, x.to_index)).collect();
@@ -781,6 +849,7 @@ mod tests {
     fn stretch(name: Option<&str>, road_ref: Option<&str>, km: f64) -> RoadStretch {
         RoadStretch {
             name: name.map(str::to_string),
+            name_en: None,
             road_ref: road_ref.map(str::to_string),
             road_class: "trunk".into(),
             km,

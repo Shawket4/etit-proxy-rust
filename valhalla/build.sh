@@ -11,13 +11,19 @@
 #   timezones.sqlite       so a departure time is read as Cairo local time
 #   valhalla.json          service config, paths relative to /data
 #   apex-time-bans.json    every way a time ban caught (etit-proxy flags their use)
+#   apex-road-names.json   name:en by way id for the major roads (etit-proxy's road
+#                          lists; Valhalla itself serves only the Arabic name)
 #   BUILD_INFO             Valhalla version + image digest, extract date, rule checksum
 #
 # Steps:
 #   1. Download the Egypt extract (FRESH=1 forces a new one).
 #   2. apply_time_bans.py writes time-bans.json into it as hgv:conditional.
-#   3. Valhalla builds timezones, admins and tiles from the result, then packs
+#   3. export_road_names.py writes the English road names from the same extract.
+#   4. Valhalla builds timezones, admins and tiles from the result, then packs
 #      the tiles into one tar.
+#
+# The names alone, into an existing out/ (the tiles unchanged, same extract):
+#   $PYTHON export_road_names.py $BUILD_DIR/egypt-latest.osm.pbf $BUILD_DIR/out/apex-road-names.json
 #
 # Env:
 #   VALHALLA_IMAGE  default ghcr.io/valhalla/valhalla:latest (BUILD_INFO pins the digest;
@@ -54,7 +60,10 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 "$PYTHON" "$SCRIPT_DIR/apply_time_bans.py" "$SCRIPT_DIR/time-bans.json" \
   "$BUILD_DIR/egypt-latest.osm.pbf" "$BUILD_DIR/egypt-apex.osm.pbf" "$OUT/apex-time-bans.json"
 
-# 3. Valhalla. Everything runs in the container with $BUILD_DIR at /build.
+echo "== English road names =="
+"$PYTHON" "$SCRIPT_DIR/export_road_names.py" "$BUILD_DIR/egypt-latest.osm.pbf" "$OUT/apex-road-names.json"
+
+# 4. Valhalla. Everything runs in the container with $BUILD_DIR at /build.
 v() { $DOCKER run --rm -t -v "$BUILD_DIR:/build" -w /build "$VALHALLA_IMAGE" "$@"; }
 if ! $DOCKER pull -q "$VALHALLA_IMAGE" >/dev/null; then
   # Offline or the registry is slow: a copy already here is fine, since
@@ -103,7 +112,7 @@ echo "== Tar =="
 v valhalla_build_extract -c /build/build.json -v
 $DOCKER run --rm -v "$BUILD_DIR:/build" "$VALHALLA_IMAGE" rm -rf /build/out/valhalla_tiles /build/build.json
 
-# 4. What built this. deploy.sh runs exactly this image digest on the VPS.
+# 5. What built this. deploy.sh runs exactly this image digest on the VPS.
 VERSION="$($DOCKER run --rm "$VALHALLA_IMAGE" valhalla_service --version 2>/dev/null | tr -d '\r' | head -1)"
 DIGEST="$($DOCKER image inspect --format '{{index .RepoDigests 0}}' "$VALHALLA_IMAGE")"
 {

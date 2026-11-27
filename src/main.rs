@@ -159,7 +159,8 @@ async fn main() -> anyhow::Result<()> {
             cfg.truck.clone(),
             cfg.timezone,
             cfg.valhalla_time_bans.clone(),
-        ),
+        )
+        .with_road_names(cfg.valhalla_road_names.clone()),
         broadcaster: broadcaster.clone(),
         started_at:  Instant::now(),
         pending_rescan: std::sync::Arc::new(parking_lot::Mutex::new((

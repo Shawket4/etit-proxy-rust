@@ -10,6 +10,8 @@
 //!   way id, so a matched trace can be checked against them.
 //! - [`roads`]    — the major roads a route takes, in order, for the fee
 //!   lookup's list (read from Valhalla's edges by the client).
+//! - [`names`]    — English road names by way id, shipped with each build
+//!   (Valhalla serves only the Arabic name).
 //!
 //! Closed roads are data, not request flags: `valhalla/build.sh` writes them
 //! into the map (`hgv=no` when closed at every hour, `hgv:conditional` when
@@ -17,6 +19,7 @@
 //! Valhalla applies them itself.
 
 pub mod bans;
+pub mod names;
 pub mod roads;
 pub mod valhalla;
 
