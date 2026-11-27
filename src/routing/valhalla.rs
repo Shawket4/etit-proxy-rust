@@ -3,10 +3,11 @@
 //! Three calls, all planned for the configured [`Truck`]:
 //!
 //! - [`RoutingClient::route`]: the best legal route for a truck leaving at
-//!   a given time. Closed roads live in the tiles (`hgv=no`, or
-//!   `hgv:conditional` for a timed ban), so the departure time alone decides
-//!   whether a timed one may be used: no exclude flag, no night-window logic
-//!   here.
+//!   a given time: Valhalla's shortest route when it is not much slower than
+//!   its time-based one ([`prefer`]), else the time-based one. Closed roads
+//!   live in the tiles (`hgv=no`, or `hgv:conditional` for a timed ban), so
+//!   the departure time alone decides whether a timed one may be used: no
+//!   exclude flag, no night-window logic here.
 //! - [`RoutingClient::match_trace`]: snaps a timestamped GPS trace to the
 //!   roads it drove (Valhalla's Meili). It returns the OSM ways driven and
 //!   when, which is what lets the audit check them against the bans.
@@ -52,6 +53,24 @@ pub struct Route {
     pub duration_secs: i64,
     /// polyline5.
     pub geometry: String,
+}
+
+/// The shortest route is taken when its driving time is at most this many
+/// times the time-based route's (owner rule, 2026-11-27).
+pub const SHORTEST_MAX_TIME_RATIO: f64 = 1.15;
+
+/// Between Valhalla's time-based route and its shortest route for the same
+/// trip: the shortest, unless it takes more than
+/// [`SHORTEST_MAX_TIME_RATIO`] × the time-based route's time. A shortest
+/// route that is no shorter changes nothing, so the time-based one stays.
+pub fn prefer(fastest: Route, shortest: Route) -> Route {
+    // Half a second of slack: 1.15 × 6000 s is 6899.999… in floating point.
+    let quick_enough = (shortest.duration_secs as f64) <= SHORTEST_MAX_TIME_RATIO * fastest.duration_secs as f64 + 0.5;
+    if quick_enough && shortest.distance_km < fastest.distance_km {
+        shortest
+    } else {
+        fastest
+    }
 }
 
 /// One OSM way the matched path drove, with when the truck was on it.
@@ -212,6 +231,15 @@ impl RoutingClient {
 
     /// Best legal route from → to (optionally through `via`) for a truck
     /// leaving at `dep`.
+    ///
+    /// Valhalla is asked twice, at once: its time-based route and its
+    /// shortest (`shortest: true`). The shortest wins when it takes no more
+    /// than [`SHORTEST_MAX_TIME_RATIO`] of the time-based route's time; see
+    /// [`prefer`]. Valhalla's time-based search on long trips can miss a
+    /// road that is both shorter and quicker: Somed → Qena came out 695 km
+    /// inland when our trucks drive the Red Sea coast at ~541 km (owner rule,
+    /// 2026-11-27). Both requests carry the same truck and closed roads, so
+    /// either answer is legal. If one request fails, the other is used.
     pub async fn route(
         &self,
         from: (f64, f64),
@@ -219,19 +247,50 @@ impl RoutingClient {
         via: &[(f64, f64)],
         dep: Departure,
     ) -> Result<Route> {
+        let (fastest, shortest) = tokio::join!(
+            self.route_costed(from, to, via, dep, false),
+            self.route_costed(from, to, via, dep, true),
+        );
+        match (fastest, shortest) {
+            (Ok(f), Ok(s)) => Ok(prefer(f, s)),
+            (Ok(f), Err(e)) => {
+                tracing::debug!(error = %e, "shortest route failed; keeping the time-based one");
+                Ok(f)
+            }
+            (Err(e), Ok(s)) => {
+                tracing::debug!(error = %e, "time-based route failed; using the shortest");
+                Ok(s)
+            }
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+
+    /// One Valhalla route request, time-based or shortest.
+    async fn route_costed(
+        &self,
+        from: (f64, f64),
+        to: (f64, f64),
+        via: &[(f64, f64)],
+        dep: Departure,
+        shortest: bool,
+    ) -> Result<Route> {
         let mut locations = vec![json!({ "lat": from.0, "lon": from.1, "type": "break" })];
         for (la, ln) in via {
             locations.push(json!({ "lat": la, "lon": ln, "type": "through" }));
         }
         locations.push(json!({ "lat": to.0, "lon": to.1, "type": "break" }));
 
+        let mut costing = self.truck_costing();
+        if shortest {
+            costing["truck"]["shortest"] = json!(true);
+        }
         let v = self
             .post(
                 "route",
                 &json!({
                     "locations": locations,
                     "costing": "truck",
-                    "costing_options": self.truck_costing(),
+                    "costing_options": costing,
                     "date_time": self.date_time(dep),
                     "units": "kilometers",
                     "directions_type": "none",
@@ -717,6 +776,26 @@ mod tests {
         assert!(parse_road_edges(&json!({"edges": [], "shape": ""})).is_err());
     }
 
+    fn drive(km: f64, minutes: i64) -> Route {
+        Route { distance_km: km, duration_secs: minutes * 60, geometry: format!("{km}") }
+    }
+
+    #[test]
+    fn the_shortest_route_wins_unless_it_is_much_slower() {
+        // Somed -> Qena (2026-11-27): the time-based search goes inland, the
+        // shortest takes the coast and is quicker too.
+        assert_eq!(prefer(drive(695.4, 506), drive(542.9, 368)).distance_km, 542.9);
+        // Shorter and up to 15% slower: still the shortest.
+        assert_eq!(prefer(drive(39.5, 100), drive(33.3, 115)).distance_km, 33.3);
+        // More than 15% slower: the time-based route stays (Mostorod ->
+        // 6th of October on the Ring Road, 55.4 km / 45 min vs 52.6 km / 58 min).
+        assert_eq!(prefer(drive(55.4, 45), drive(52.6, 58)).distance_km, 55.4);
+        assert_eq!(prefer(drive(39.5, 100), drive(33.3, 116)).distance_km, 39.5);
+        // A "shortest" that is no shorter changes nothing.
+        assert_eq!(prefer(drive(91.6, 72), drive(91.6, 70)).geometry, "91.6");
+        assert_eq!(prefer(drive(91.6, 72), drive(95.0, 60)).distance_km, 91.6);
+    }
+
     #[test]
     fn a_route_reads_its_summary_and_comes_out_as_polyline5() {
         let r = parse_route(&serde_json::from_str(ROUTE).unwrap()).unwrap();
@@ -835,7 +914,14 @@ mod tests {
         let r = client.route((30.06, 31.21), (30.05, 31.20), &[(30.055, 31.205)], Departure::At(at)).await.unwrap();
         assert_eq!(r.distance_km, 4.007);
 
-        let body = seen.lock().unwrap()[0].clone();
+        // Asked twice: time-based and shortest, otherwise the same request.
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        let mut shortest: Vec<bool> =
+            bodies.iter().map(|b| b["costing_options"]["truck"]["shortest"].as_bool().unwrap_or(false)).collect();
+        shortest.sort();
+        assert_eq!(shortest, vec![false, true]);
+        let body = bodies[0].clone();
         assert_eq!(body["costing"], "truck");
         assert_eq!(body["date_time"], json!({"type": 1, "value": "2026-11-28T13:00"}));
         let truck = &body["costing_options"]["truck"];

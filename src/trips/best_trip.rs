@@ -15,7 +15,7 @@
 //! - The percentile stays put even when most readings on a route are gaps;
 //!   a median would sink with them and let a gap through.
 //! - Taking the shorter keeps a genuinely shorter road the trucks found
-//!   (Valhalla optimises time, not km) from being thrown out.
+//!   (the truck route is not always the shortest road) from being thrown out.
 //!
 //! The floor alone is not enough. Two more kinds of short reading look like
 //! drives but are not the whole route (both seen on Somed → Qena,

@@ -159,6 +159,20 @@ async fn matrix_and_optimizer_answer_for_several_drops() {
 const SOMED: (f64, f64) = (29.594416, 32.329073);
 const QENA: (f64, f64) = (26.178375, 32.686582);
 
+/// The route preference (owner rule, 2026-11-27): Valhalla's time-based
+/// search sends Somed -> Qena 695 km inland; the shortest route takes the
+/// Red Sea coast like our trucks (~541 km) and is quicker, so it wins.
+#[tokio::test]
+async fn somed_to_qena_takes_the_coast() {
+    let Some(c) = client() else { return };
+    let r = c.route(SOMED, QENA, &[], Departure::AnyHour).await.unwrap();
+    println!("Somed -> Qena: {:.1} km, {} min", r.distance_km, r.duration_secs / 60);
+    assert!((r.distance_km - 543.0).abs() < 10.0, "{:.1} km: the coast road is about 543 km", r.distance_km);
+    let roads = c.roads(&r.geometry).await.unwrap();
+    assert!(roads.iter().any(|s| s.road_ref.as_deref() == Some("11")), "on road 11 down the coast");
+    assert_eq!(roads.last().unwrap().road_ref.as_deref(), Some("244"), "into Qena on Qena-Safaga");
+}
+
 /// The fee lookup's road list, on the busiest route: a handful of major
 /// roads that add up to the route and tile its geometry, and the same roads
 /// again when the route is driven and map-matched like a real trip.
