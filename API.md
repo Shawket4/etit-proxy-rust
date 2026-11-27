@@ -379,3 +379,34 @@ routes.
 
 Every field is always present. With `trips: 0` the km and day fields are
 `null`. `400` if `terminal` or `drop_off` is missing or blank.
+
+### 7.2 `GET /service/trip-audit/routes?terminal=&drop_off=&from_lat=&from_lng=&to_lat=&to_lng=`
+
+Two drives of one route for the fee lookup's map, both on the road network:
+
+- **`truck_route`**: Valhalla's best route for the configured tanker between
+  the two pins. It must be legal at any hour, so closed roads are avoided.
+  It is `null` when no pins are sent or Valhalla cannot route.
+- **`best_trip`**: the shortest real drive our trucks made. The candidates
+  are the route's road-matched outbound legs (the same legs as §7.1, minus
+  chord sums), and the shape is Valhalla's map match of the truck's GPS.
+  - A reading shorter than `min_share` (0.8) of a reference is a GPS gap:
+    the matched shape bridges the gap with a straight line. Such readings
+    are counted in `set_aside` and never shown as the best.
+  - The reference is the shorter of the truck route and the 75th-percentile
+    trip.
+  - `best_trip` is `null` when no reading clears the floor.
+
+The pins are optional, but send all four or none (`400` otherwise).
+
+```jsonc
+{
+  "terminal": "Somed", "drop_off": "Qena",
+  "truck_route": { "distance_km": 548.2, "duration_min": 410.5,
+                   "geometry": "<polyline5>", "departure": "any_hour" },
+  "best_trip":   { "km": 535.8, "drive_min": 452.0,   // geofence exit to entry, stops included
+                   "day": "2026-10-12", "depart_ts": "2026-10-12T03:10:00Z",
+                   "arrive_ts": "2026-10-12T10:42:00Z", "geometry": "<polyline5>" },
+  "trips_considered": 565, "set_aside": 5, "min_share": 0.8
+}
+```

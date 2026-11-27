@@ -76,6 +76,18 @@ pub struct TripMatchRow {
     pub critical_count: i64,
 }
 
+/// One stored leg, as a drive the fee lookup's map draws.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct LegDrive {
+    pub actual_km: f64,
+    pub day_local: String,
+    pub depart_ts: String,
+    pub arrive_ts: String,
+    pub actual_secs: i64,
+    /// polyline5, road-matched.
+    pub actual_geometry: String,
+}
+
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct TripLegRow {
     pub id: i64,
@@ -436,6 +448,51 @@ impl TripAuditRepo {
                 road_matched: method == "matched",
             })
             .collect())
+    }
+
+    /// The route's road-matched outbound legs that have a shape to draw, as
+    /// best-trip candidates: id and km only, the shapes stay in the table.
+    /// Same route match as [`Self::outbound_legs_for_route`].
+    pub async fn best_trip_candidates(
+        &self,
+        terminal: &str,
+        drop_off: &str,
+    ) -> Result<Vec<crate::trips::best_trip::Candidate>> {
+        let rows: Vec<(i64, f64)> = sqlx::query_as(
+            r#"SELECT l.id, l.actual_km
+                 FROM trip_match_legs l
+                 JOIN trip_matches m ON m.id = l.match_id
+                WHERE l.leg_type = 'outbound'
+                  AND l.seq = 0
+                  AND l.distance_method = 'matched'
+                  AND l.actual_geometry != ''
+                  AND lower(trim(l.to_name)) = lower(trim(?1))
+                  AND (lower(trim(l.from_name))      = lower(trim(?2))
+                    OR lower(trim(m.terminal_name))  = lower(trim(?2)))"#,
+        )
+        .bind(drop_off)
+        .bind(terminal)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, km)| crate::trips::best_trip::Candidate { id, km })
+            .collect())
+    }
+
+    /// One leg as a drive to draw: km, day, times and its matched shape.
+    pub async fn leg_drive(&self, leg_id: i64) -> Result<Option<LegDrive>> {
+        Ok(sqlx::query_as(
+            r#"SELECT l.actual_km, m.day_local, l.depart_ts, l.arrive_ts,
+                      l.actual_secs, l.actual_geometry
+                 FROM trip_match_legs l
+                 JOIN trip_matches m ON m.id = l.match_id
+                WHERE l.id = ?1"#,
+        )
+        .bind(leg_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1021,6 +1078,29 @@ mod tests {
         assert_eq!(r.outbound_legs_for_route("Mostorod Depot", "Banha").await.unwrap().len(), 1);
         assert_eq!(r.outbound_legs_for_route("Mostorod", "Banha").await.unwrap().len(), 1);
         assert!(r.outbound_legs_for_route("Suez", "Banha").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn best_trip_candidates_are_matched_legs_with_a_shape() {
+        let r = repo().await;
+        let run = r.insert_scan_run().await.unwrap();
+        let mut shaped = new_leg(0, "outbound", "Somed", "Qena", 541.7, "matched");
+        shaped.actual_geometry = "_p~iF~ps|U_ulLnnqC";
+        let mut chord = new_leg(0, "outbound", "Somed", "Qena", 530.0, "chord");
+        chord.actual_geometry = "_p~iF~ps|U";
+        let bare = new_leg(0, "outbound", "Somed", "Qena", 520.0, "matched");
+        for (trip, leg) in [(21, shaped), (22, chord), (23, bare)] {
+            r.store_match(&new_match(run, trip, "2026-11-20", "Somed"), &[leg], &[], &[]).await.unwrap();
+        }
+
+        let c = r.best_trip_candidates("Somed", "Qena").await.unwrap();
+        assert_eq!(c.len(), 1, "a chord-sum leg and a leg without a shape are not drawable");
+        assert_eq!(c[0].km, 541.7);
+
+        let d = r.leg_drive(c[0].id).await.unwrap().unwrap();
+        assert_eq!((d.day_local.as_str(), d.actual_secs), ("2026-11-20", 7200));
+        assert_eq!(d.actual_geometry, "_p~iF~ps|U_ulLnnqC");
+        assert!(r.leg_drive(-1).await.unwrap().is_none());
     }
 
     #[tokio::test]
