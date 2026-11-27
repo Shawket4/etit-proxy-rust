@@ -186,7 +186,10 @@ Requires `X-Admin-Token` header.
 
 The one place any service asks "how far is A from B by road" (FalconGo fee
 mappings and trip summaries, the advisor). Routed by Valhalla for the
-configured tanker (`TRUCK_*`), time bans included.
+configured tanker (`TRUCK_*`), time bans included. Valhalla is asked for its
+time-based and its shortest route; the shortest is returned when its time is
+at most 1.15 × the time-based route's (docs/valhalla.md). `/optimize` below is
+time-based only.
 
 ```jsonc
 // request
@@ -385,7 +388,9 @@ Every field is always present. With `trips: 0` the km and day fields are
 Two drives of one route for the fee lookup's map, both on the road network:
 
 - **`truck_route`**: Valhalla's best route for the configured tanker between
-  the two pins. It must be legal at any hour, so closed roads are avoided.
+  the two pins: its shortest route unless that is over 1.15 × slower than its
+  time-based one (as §4.4). It must be legal at any hour, so closed roads are
+  avoided.
   It is `null` when no pins are sent or Valhalla cannot route.
 - **`best_trip`**: the shortest **whole** drive our trucks made. The
   candidates are the route's road-matched outbound legs (the same legs as

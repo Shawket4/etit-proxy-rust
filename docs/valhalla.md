@@ -22,6 +22,38 @@ separate product and untouched.
 | Trip optimiser (FalconGo summaries) | Madar's **car** OSRM `/trip` | `/admin/routing/optimize` (Valhalla `optimized_route`, truck) |
 | Data size on the VPS | ~3.2 GB, loaded into RAM | ~830 MB, memory-mapped (≈50 MB RSS idle) |
 
+## Which route: shortest unless much slower
+
+`RoutingClient::route` asks Valhalla for two routes at once, both with the
+tanker's costing and the closed roads:
+- its time-based route;
+- its shortest route (`shortest: true`).
+
+It uses the shortest one when that one's driving time is at most **1.15 ×**
+the time-based route's; otherwise the time-based one (owner rule,
+2026-11-27, `SHORTEST_MAX_TIME_RATIO`).
+
+Why: on long trips Valhalla's time-based search can miss a road that is both
+shorter and quicker. Somed → Qena came out 695 km inland, via the Regional
+Ring Road and the Cairo–Assiut desert road, while our trucks drive the Red
+Sea coast at about 541 km. Access, tags and penalties were all ruled out:
+the long-route search simply missed the coast road, and `shortest: true`
+found it (542.9 km, quicker too). On short city trips the shortest route can
+be a slow crawl through town; the 15% cap keeps the faster road there (e.g.
+Mostorod → 6th of October stays on the Ring Road).
+
+This covers everything that calls `route`: the trip audit's per-leg optimal
+routes, `/admin/routing/route` (FalconGo fee mappings and trip summaries,
+the advisor) and the fee lookup's truck route.
+
+**Not changed:** the distance matrix (`sources_to_targets`, the drop-order
+check) and `optimized_route` (`/admin/routing/optimize`) still use Valhalla's
+time-based costing alone. Valhalla has no "prefer shortest within a time
+budget" for those, and asking twice would double a matrix's cost.
+
+Stored figures computed before the change keep the old route until
+recomputed: rescan the trip audit, and re-run FalconGo's fee-mapping enrich.
+
 ## Changing a rule
 
 - **Truck size, weight or speed cap:** set `TRUCK_*` in etit-proxy's
