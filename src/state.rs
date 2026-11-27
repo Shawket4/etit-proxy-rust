@@ -15,7 +15,7 @@ use crate::services::broadcaster::Broadcaster;
 use crate::services::history::HistoryService;
 use crate::services::live::LiveService;
 use crate::services::vehicles::VehiclesService;
-use crate::trips::osrm::OsrmClient;
+use crate::routing::RoutingClient;
 use crate::trips::pg::ApexDb;
 use crate::upstream::EtitClient;
 use crate::db::{TripAuditRepo, ZonesRepo};
@@ -33,7 +33,8 @@ pub struct AppState {
     pub trip_repo: TripAuditRepo,
     /// Read-only apex Postgres; None ⇒ trip audit disabled.
     pub apex_db: Option<ApexDb>,
-    pub osrm: OsrmClient,
+    /// Valhalla, planned for our tanker: every road route, match and matrix.
+    pub routing: RoutingClient,
     pub broadcaster: Arc<Broadcaster>,
     pub started_at: Instant,
     /// Days queued by the FalconGo registration hook, drained by a single
@@ -41,7 +42,7 @@ pub struct AppState {
     pub pending_rescan: Arc<Mutex<(BTreeSet<chrono::NaiveDate>, bool)>>,
     /// Serializes scans: nightly, hook-flush, dashboard, and startup scans
     /// take this before touching anything. On one core, two concurrent
-    /// scans would double ETIT/OSRM load and interleave writes for no gain;
+    /// scans would double ETIT/Valhalla load and interleave writes for no gain;
     /// waiting is always correct because scans are idempotent upserts.
     pub scan_lock: Arc<tokio::sync::Mutex<()>>,
 }

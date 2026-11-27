@@ -148,10 +148,17 @@ async fn main() -> anyhow::Result<()> {
         zones_repo:  zones_repo.clone(),
         trip_repo:   trip_repo.clone(),
         apex_db:     apex_db.clone(),
-        osrm:        etit_proxy::trips::osrm::OsrmClient::new(
-            http.clone(),
-            cfg.osrm_url.clone(),
-            cfg.osrm_exclude_class.clone(),
+        routing:     etit_proxy::routing::RoutingClient::new(
+            // Its own client: matching a long haul's full trace can take
+            // well over the 10 s the ETIT-facing client allows.
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .context("building routing http client")?,
+            cfg.valhalla_url.clone(),
+            cfg.truck.clone(),
+            cfg.timezone,
+            cfg.valhalla_time_bans.clone(),
         ),
         broadcaster: broadcaster.clone(),
         started_at:  Instant::now(),

@@ -3,7 +3,8 @@
 //! All public endpoints live under `/api/v1/*`. Anything else
 //! (`/healthz`, `/metrics`, `/admin/*`) is operational and explicitly
 //! versionless — its contract is implementation-defined and subject to
-//! change without notice.
+//! change without notice. `/service/*` is the exception: other Apex services
+//! depend on it, so its contract is documented in API.md and kept stable.
 
 pub mod dto;
 pub mod handlers;
@@ -56,10 +57,10 @@ pub fn router(state: AppState) -> Router {
     let admin_state = state.clone();
     let admin = Router::new()
         .route("/cache/invalidate", post(handlers::admin::invalidate))
-        // The one place any service asks how far A is from B by road. See the
-        // handler: FalconGo used to build its own OSRM URL and silently skipped
-        // the time-gated exclude this service applies.
+        // The one place any service asks how far A is from B by road, or in
+        // which order to visit several drops: Valhalla, for our tanker.
         .route("/routing/route",    post(handlers::admin::route))
+        .route("/routing/optimize", post(handlers::admin::optimize))
         .route("/auth/relogin",     post(handlers::admin::relogin))
         .route("/users/unblock",    post(handlers::admin::unblock_user))
         .route("/trip-audit/rescan", post(handlers::trip_audit::queue_rescan))
@@ -70,9 +71,18 @@ pub fn router(state: AppState) -> Router {
         .route("/trip-audit/scan",   post(handlers::trip_audit::run_scan_now))
         .layer(from_fn_with_state(admin_state, middleware::admin_guard));
 
+    // Service — read-only lookups for other Apex services (the fee lookup),
+    // gated by their own token so a reader never holds the admin key. Off
+    // (404) unless SERVICE_READ_TOKEN is set.
+    let service_state = state.clone();
+    let service = Router::new()
+        .route("/trip-audit/driven-km", get(handlers::service::driven_km))
+        .layer(from_fn_with_state(service_state, middleware::service_guard));
+
     Router::new()
         .nest("/api/v1", v1)
         .nest("/admin",  admin)
+        .nest("/service", service)
         .route("/healthz", get(handlers::health::healthz))
         .route("/metrics", get(handlers::metrics::metrics))
         .with_state(state)

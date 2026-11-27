@@ -6,7 +6,8 @@
 //!   1. Load the location catalog and planned trips from apex Postgres.
 //!   2. Per vehicle, chronologically: pull ETIT history (cache → SQLite →
 //!      upstream), reconstruct the trip with the matcher, enrich each leg
-//!      with the OSRM optimal, raise flags, persist.
+//!      with the best legal truck route (Valhalla, at the leg's departure
+//!      time) and the roads it actually drove, raise flags, persist.
 //!   3. Calibration: cluster recent long stops, upsert pin suggestions.
 
 use std::collections::{BTreeSet, HashMap};
@@ -18,6 +19,8 @@ use crate::db::trip_audit::{NewFlag, NewLeg, NewMatch};
 use crate::state::AppState;
 use crate::zones::geo::haversine_m;
 use crate::zones::PointTS;
+
+use crate::routing::Departure;
 
 use super::calibrate;
 use super::matcher::{match_trip, MatchInput, MatcherConfig, StopTS};
@@ -40,6 +43,11 @@ pub async fn run_scan(state: AppState, dates: Option<Vec<NaiveDate>>) -> TripSca
     // hook flush queued behind the nightly still runs, just later.
     let _serial = state.scan_lock.clone();
     let _guard = _serial.lock().await;
+
+    // The ban list ships with each tiles deploy; pick up a new one here
+    // rather than needing a restart.
+    let ban_ways = state.routing.reload_bans();
+    tracing::info!(ban_ways, "trip scan: time bans loaded");
 
     let mut summary = TripScanSummary {
         run_id: 0,
@@ -364,8 +372,12 @@ async fn do_run_scan(
                 state.cfg.trip_allowed_point_dwell_secs,
             );
 
-            // ---- OSRM enrichment (only for legs we detected) ------------------
-            let mut osrm_flags: Vec<(Flag, Option<usize>)> = Vec::new();
+            // ---- Routing enrichment (only for legs we detected) ---------------
+            // Valhalla, planned for our tanker. Each leg is matched to the
+            // roads it drove and compared with the best legal route for a
+            // truck leaving when this one did.
+            let bans = state.routing.bans();
+            let mut route_flags: Vec<(Flag, Option<usize>)> = Vec::new();
             for (leg_pos, leg) in outcome.legs.iter_mut().enumerate() {
                 if leg.leg_type == "garage" {
                     // A dwell, not a drive: nothing to match or route.
@@ -376,7 +388,7 @@ async fn do_run_scan(
                 // band around the chord-sum, the matched road distance
                 // replaces it (and the clean geometry replaces the zigzag).
                 if leg.raw_points.len() >= 5 {
-                    match state.osrm.match_trace(&leg.raw_points).await {
+                    match state.routing.match_trace(&leg.raw_points).await {
                         Ok(m) => {
                             let chord = leg.actual_km;
                             let sane = chord < 0.5
@@ -384,6 +396,29 @@ async fn do_run_scan(
                             if m.coverage >= state.cfg.trip_match_min_coverage && sane {
                                 leg.actual_km = m.distance_km;
                                 leg.distance_method = "matched";
+                                // The ways driven, against the bans: a truck
+                                // on a road closed to it, while it was closed.
+                                for u in super::bans_check::banned_use(&m.edges, &bans, &state.cfg.timezone) {
+                                    route_flags.push((
+                                        Flag {
+                                            flag_type: "banned_road",
+                                            severity: "critical",
+                                            details: serde_json::json!({
+                                                "leg_seq": leg.seq,
+                                                "ban_id": u.ban_id,
+                                                "road": u.label,
+                                                "road_ar": u.label_ar,
+                                                "always": u.always,
+                                                "banned_hours": u.hours,
+                                                "from_ts": u.from_ts,
+                                                "to_ts": u.to_ts,
+                                                "km": u.km,
+                                                "roads": u.roads,
+                                            }),
+                                        },
+                                        Some(leg_pos),
+                                    ));
+                                }
                                 let joined: Vec<(f64, f64)> = m
                                     .geometries
                                     .iter()
@@ -428,7 +463,7 @@ async fn do_run_scan(
                     .map(|st| (st.lat, st.lng))
                     .collect();
                 if !via.is_empty() {
-                    osrm_flags.push((
+                    route_flags.push((
                         Flag {
                             flag_type: "allowed_stop",
                             severity: "info",
@@ -443,8 +478,8 @@ async fn do_run_scan(
                 }
 
                 match state
-                    .osrm
-                    .route(leg.from_coords, leg.to_coords, &via, !leg.night_window)
+                    .routing
+                    .route(leg.from_coords, leg.to_coords, &via, Departure::At(leg.depart_ts))
                     .await
                 {
                     Ok(route) => {
@@ -481,7 +516,7 @@ async fn do_run_scan(
                             if ratio > state.cfg.trip_flag_distance_ratio
                                 && leg.actual_km - route.distance_km > MIN_FLAGGABLE_EXCESS_KM
                             {
-                                osrm_flags.push((
+                                route_flags.push((
                                     Flag {
                                         flag_type: "excess_distance",
                                         severity: if ratio > state.cfg.trip_flag_distance_ratio * 1.5
@@ -520,7 +555,7 @@ async fn do_run_scan(
                             None => p95 > dev_threshold,
                         };
                         if deviated && costs_distance {
-                            osrm_flags.push((
+                            route_flags.push((
                                 Flag {
                                     flag_type: "route_deviation",
                                     severity: "warning",
@@ -540,7 +575,7 @@ async fn do_run_scan(
                             parent_trip_id = trip.parent_trip_id,
                             leg = leg.seq,
                             error = %e,
-                            "OSRM route failed; leg left uncompared"
+                            "routing failed; leg left uncompared"
                         );
                     }
                 }
@@ -564,146 +599,78 @@ async fn do_run_scan(
                 (None, None)
             };
 
-            // ---- Least-distance drop order --------------------------------------
+            // ---- Best drop order ------------------------------------------------
             // With several drop-offs, the honest optimal is the BEST visiting
-            // order, not the driven one. When a cheaper order exists, the
-            // trip-level optimal uses it and the driven order is flagged.
+            // order, not the driven one. One truck distance matrix over the
+            // terminal and the drops (at the trip's departure) answers both
+            // that and whether bundling the drops on one truck paid at all.
             if osrm_km.is_some() {
-                let deliver_legs: Vec<(String, (f64, f64), f64, bool)> = outcome
+                let deliver_legs: Vec<(String, (f64, f64))> = outcome
                     .legs
                     .iter()
                     .filter(|l| matches!(l.leg_type, "outbound" | "between"))
-                    .map(|l| (l.to_name.clone(), l.to_coords, l.osrm_km.unwrap_or(0.0), l.night_window))
-                    .filter(|(n, _, _, _)| n != "garage")
+                    .filter(|l| l.to_name != "garage")
+                    .map(|l| (l.to_name.clone(), l.to_coords))
                     .collect();
-                if deliver_legs.len() >= 2 && deliver_legs.len() <= 4 {
-                    let start = outcome
-                        .legs
-                        .iter()
-                        .find(|l| l.leg_type == "outbound")
-                        .map(|l| l.from_coords);
-                    if let Some(start) = start {
-                        let driven_km: f64 = deliver_legs.iter().map(|(_, _, k, _)| *k).sum();
-                        let night = deliver_legs[0].3;
-                        let nodes: Vec<(f64, f64)> = std::iter::once(start)
-                            .chain(deliver_legs.iter().map(|(_, c, _, _)| *c))
-                            .collect();
-                        let mut pair: HashMap<(usize, usize), f64> = HashMap::new();
-                        let mut all_ok = true;
-                        'pairs: for i in 0..nodes.len() {
-                            for j in 1..nodes.len() {
-                                if i == j {
-                                    continue;
-                                }
-                                match state.osrm.route(nodes[i], nodes[j], &[], !night).await {
-                                    Ok(r) => {
-                                        pair.insert((i, j), r.distance_km);
-                                    }
-                                    Err(_) => {
-                                        all_ok = false;
-                                        break 'pairs;
-                                    }
-                                }
-                            }
+                let start = outcome.legs.iter().find(|l| l.leg_type == "outbound");
+                if let Some(start) = start.filter(|_| {
+                    (2..=super::drop_order::MAX_DROPS).contains(&deliver_legs.len())
+                }) {
+                    let points: Vec<(f64, f64)> = std::iter::once(start.from_coords)
+                        .chain(deliver_legs.iter().map(|(_, c)| *c))
+                        .collect();
+                    let checked = match state
+                        .routing
+                        .matrix(&points, Departure::At(start.depart_ts))
+                        .await
+                    {
+                        Ok(m) => super::drop_order::check_order(&m),
+                        Err(e) => {
+                            tracing::warn!(parent_trip_id = trip.parent_trip_id, error = %e, "drop-order matrix failed");
+                            None
                         }
-                        if all_ok {
-                            let n = deliver_legs.len();
-                            let mut idx: Vec<usize> = (1..=n).collect();
-                            let mut best_km = f64::MAX;
-                            let mut best_order: Vec<usize> = idx.clone();
-                            // Heap's algorithm over at most 4! = 24 orders.
-                            fn permute(
-                                k: usize,
-                                arr: &mut Vec<usize>,
-                                pair: &HashMap<(usize, usize), f64>,
-                                best_km: &mut f64,
-                                best_order: &mut Vec<usize>,
-                            ) {
-                                if k == 1 {
-                                    let mut total = 0.0;
-                                    let mut prev = 0usize;
-                                    for &x in arr.iter() {
-                                        total += pair.get(&(prev, x)).copied().unwrap_or(f64::MAX / 8.0);
-                                        prev = x;
-                                    }
-                                    if total < *best_km {
-                                        *best_km = total;
-                                        *best_order = arr.clone();
-                                    }
-                                    return;
-                                }
-                                for i in 0..k {
-                                    permute(k - 1, arr, pair, best_km, best_order);
-                                    if k % 2 == 0 {
-                                        arr.swap(i, k - 1);
-                                    } else {
-                                        arr.swap(0, k - 1);
-                                    }
-                                }
-                            }
-                            permute(n, &mut idx, &pair, &mut best_km, &mut best_order);
-
-                            if best_km + 0.5 < driven_km {
-                                let driven_names: Vec<&str> =
-                                    deliver_legs.iter().map(|(n, _, _, _)| n.as_str()).collect();
-                                let optimal_names: Vec<&str> = best_order
-                                    .iter()
-                                    .map(|&i| deliver_legs[i - 1].0.as_str())
-                                    .collect();
-                                osrm_km = osrm_km.map(|t| t - driven_km + best_km);
-                                osrm_flags.push((
+                    };
+                    if let Some(c) = checked {
+                        let names = |order: &[usize]| -> Vec<String> {
+                            order.iter().map(|&i| deliver_legs[i].0.clone()).collect()
+                        };
+                        if c.best_km + 0.5 < c.driven_km {
+                            osrm_km = osrm_km.map(|t| t - c.driven_km + c.best_km);
+                            route_flags.push((
+                                Flag {
+                                    flag_type: "suboptimal_order",
+                                    severity: "warning",
+                                    details: serde_json::json!({
+                                        "driven_order": names(&(0..deliver_legs.len()).collect::<Vec<_>>()),
+                                        "optimal_order": names(&c.best_order),
+                                        "driven_km": round1(c.driven_km),
+                                        "optimal_km": round1(c.best_km),
+                                        "savings_km": round1(c.driven_km - c.best_km),
+                                    }),
+                                },
+                                None,
+                            ));
+                        }
+                        // Bundling drops on one truck should beat separate
+                        // round trips. When it barely does, the drops point
+                        // in opposite directions: a dispatch-planning signal
+                        // (info), not a driver fault.
+                        if c.split_km > 1.0 {
+                            let savings_pct = 1.0 - c.bundled_km / c.split_km;
+                            if savings_pct < 0.08 {
+                                route_flags.push((
                                     Flag {
-                                        flag_type: "suboptimal_order",
-                                        severity: "warning",
+                                        flag_type: "ineffective_bundling",
+                                        severity: "info",
                                         details: serde_json::json!({
-                                            "driven_order": driven_names,
-                                            "optimal_order": optimal_names,
-                                            "driven_km": (driven_km * 10.0).round() / 10.0,
-                                            "optimal_km": (best_km * 10.0).round() / 10.0,
-                                            "savings_km": ((driven_km - best_km) * 10.0).round() / 10.0,
+                                            "drops": names(&(0..deliver_legs.len()).collect::<Vec<_>>()),
+                                            "bundled_km": round1(c.bundled_km),
+                                            "split_km": round1(c.split_km),
+                                            "savings_pct": (savings_pct * 1000.0).round() / 10.0,
                                         }),
                                     },
                                     None,
                                 ));
-                            }
-
-                            // Composition check: bundling drops on one truck
-                            // should beat separate round trips. When the
-                            // saving is negligible the drops point in
-                            // opposite directions — a dispatch-planning
-                            // signal (info), not a driver fault. Distances
-                            // use the symmetric approximation (t→d doubled).
-                            if n >= 2 {
-                                let split_km: f64 = (1..=n)
-                                    .map(|d| 2.0 * pair.get(&(0, d)).copied().unwrap_or(0.0))
-                                    .sum();
-                                let ret_km = best_order
-                                    .last()
-                                    .and_then(|&l| pair.get(&(0, l)).copied())
-                                    .unwrap_or(0.0);
-                                let bundled_km = best_km + ret_km;
-                                if split_km > 1.0 {
-                                    let savings_pct = 1.0 - bundled_km / split_km;
-                                    if savings_pct < 0.08 {
-                                        let drops: Vec<&str> = deliver_legs
-                                            .iter()
-                                            .map(|(n, _, _, _)| n.as_str())
-                                            .collect();
-                                        osrm_flags.push((
-                                            Flag {
-                                                flag_type: "ineffective_bundling",
-                                                severity: "info",
-                                                details: serde_json::json!({
-                                                    "drops": drops,
-                                                    "bundled_km": (bundled_km * 10.0).round() / 10.0,
-                                                    "split_km": (split_km * 10.0).round() / 10.0,
-                                                    "savings_pct": (savings_pct * 1000.0).round() / 10.0,
-                                                }),
-                                            },
-                                            None,
-                                        ));
-                                    }
-                                }
                             }
                         }
                     }
@@ -719,7 +686,7 @@ async fn do_run_scan(
             };
             if let Some(r) = duration_ratio {
                 if r > state.cfg.trip_flag_duration_ratio {
-                    osrm_flags.push((
+                    route_flags.push((
                         Flag {
                             flag_type: "excess_duration",
                             severity: "warning",
@@ -751,7 +718,7 @@ async fn do_run_scan(
                 }
             }
             let mut all_flags = outcome.flags.clone();
-            for (flag, leg_pos) in osrm_flags {
+            for (flag, leg_pos) in route_flags {
                 all_flags.push(flag);
                 flag_leg_pos.push(leg_pos);
             }
@@ -1417,6 +1384,10 @@ fn epoch_to_rfc3339(ts: i64) -> String {
 
 fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 

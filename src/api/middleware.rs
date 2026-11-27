@@ -6,6 +6,8 @@
 //! - **Admin guard** — if `cfg.admin_token` is unset, all `/admin/*` routes
 //!   are 404'd. Otherwise they require an `X-Admin-Token` header that
 //!   matches the configured value.
+//! - **Service guard** — the same shape for the read-only `/service/*`
+//!   surface, keyed on `cfg.service_read_token` and `X-Service-Token`.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -19,6 +21,7 @@ use crate::state::AppState;
 
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const ADMIN_HEADER: &str = "x-admin-token";
+const SERVICE_HEADER: &str = "x-service-token";
 
 /// Generates `X-Request-Id` if missing, attaches it to the request
 /// extensions for downstream code to read, and echoes it on the response.
@@ -71,6 +74,44 @@ pub async fn admin_guard(
     next.run(req).await
 }
 
+/// Guards `/service/*`: read-only lookups for other Apex services. Its token
+/// is not the admin token, so a reader cannot rescan, clear caches or force
+/// an ETIT re-login with it.
+pub async fn service_guard(
+    State(s): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let provided = req
+        .headers()
+        .get(SERVICE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match token_verdict(s.cfg.service_read_token.as_deref(), provided) {
+        Ok(()) => next.run(req).await,
+        Err(StatusCode::NOT_FOUND) => {
+            (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        Err(status) => (
+            status,
+            Json(json!({"error": "service token required", "code": "UNAUTHORIZED"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `expected` unset ⇒ the surface is off (404, so it is invisible);
+/// otherwise the provided token must match it exactly (401).
+fn token_verdict(expected: Option<&str>, provided: &str) -> Result<(), StatusCode> {
+    let Some(expected) = expected else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if provided.is_empty() || !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
 /// Constant-time byte comparison. Length mismatch short-circuits to false.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -87,4 +128,23 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[allow(dead_code)]
 pub fn extract_request_id(headers: &HeaderMap) -> Option<&str> {
     headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_surface_is_invisible_when_no_token_is_configured() {
+        assert_eq!(token_verdict(None, ""), Err(StatusCode::NOT_FOUND));
+        assert_eq!(token_verdict(None, "anything"), Err(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn service_token_must_match_exactly() {
+        assert_eq!(token_verdict(Some("s3cret"), ""), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(token_verdict(Some("s3cret"), "s3cre"), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(token_verdict(Some("s3cret"), "S3CRET"), Err(StatusCode::UNAUTHORIZED));
+        assert_eq!(token_verdict(Some("s3cret"), "s3cret"), Ok(()));
+    }
 }

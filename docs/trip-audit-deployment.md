@@ -1,5 +1,9 @@
 # Trip Audit — coordinated deployment runbook
 
+> **Superseded for routing (2026-11-27).** The OSRM steps below record the
+> original release. Routing is now Valhalla: see [`valhalla.md`](valhalla.md)
+> for the build, deploy and cutover. Everything else here still applies.
+
 The trip-audit feature spans four pieces that ship together as one release:
 FalconGo (locations schema), etit-proxy-rust (scanner + API), apex-react
 (Locations page + Trip Audit page), and the truck OSRM dataset. Nothing here

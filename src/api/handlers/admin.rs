@@ -7,6 +7,7 @@ use axum::Json;
 
 use crate::api::dto::{InvalidateRequest, InvalidateResponse, ReloginResponse, UnblockResponse};
 use crate::error::{AppError, AppResult};
+use crate::routing::Departure;
 use crate::state::AppState;
 use crate::upstream::users;
 
@@ -97,30 +98,17 @@ pub async fn unblock_user(State(s): State<AppState>) -> AppResult<Json<UnblockRe
     }))
 }
 
-/// `POST /admin/routing/route`
-///
-/// The one place any service asks "how far is A from B by road".
-///
-/// FalconGo previously built its own OSRM URL for fee-mapping enrichment. That
-/// call had no `exclude`, so it routed tankers down time-gated roads this
-/// service deliberately avoids, and the same pair of points got two different
-/// distances depending on which codebase asked. Routing through here means the
-/// exclude class, the retry-without-exclude fallback and the base URL all have
-/// exactly one definition.
+/// `POST /admin/routing/route` — see [`crate::api::dto::RouteRequest`].
 pub async fn route(
     State(s): State<AppState>,
     Json(req): Json<crate::api::dto::RouteRequest>,
 ) -> AppResult<Json<crate::api::dto::RouteResponse>> {
     let via: Vec<(f64, f64)> = req.via.iter().map(|p| (p[0], p[1])).collect();
+    let dep = departure(req.depart_at.as_deref(), req.restricted)?;
 
     let routed = s
-        .osrm
-        .route(
-            (req.from_lat, req.from_lng),
-            (req.to_lat, req.to_lng),
-            &via,
-            req.restricted,
-        )
+        .routing
+        .route((req.from_lat, req.from_lng), (req.to_lat, req.to_lng), &via, dep)
         .await
         .map_err(AppError::Internal)?;
 
@@ -129,5 +117,77 @@ pub async fn route(
         duration_min: routed.duration_secs as f64 / 60.0,
         geometry: routed.geometry,
         restricted: req.restricted,
+        departure: describe(dep, &s),
+        engine: "valhalla",
     }))
+}
+
+/// `POST /admin/routing/optimize` — see [`crate::api::dto::OptimizeRequest`].
+pub async fn optimize(
+    State(s): State<AppState>,
+    Json(req): Json<crate::api::dto::OptimizeRequest>,
+) -> AppResult<Json<crate::api::dto::OptimizeResponse>> {
+    if req.stops.is_empty() {
+        return Err(AppError::BadRequest("stops must not be empty".into()));
+    }
+    let dep = departure(req.depart_at.as_deref(), req.restricted)?;
+    let pt = |p: crate::api::dto::LatLng| (p.lat, p.lng);
+    let stops: Vec<(f64, f64)> = req.stops.iter().copied().map(pt).collect();
+    let trip = s
+        .routing
+        .optimize(pt(req.start), &stops, pt(req.end.unwrap_or(req.start)), dep)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(crate::api::dto::OptimizeResponse {
+        order: trip.order,
+        legs: trip
+            .legs
+            .into_iter()
+            .map(|l| crate::api::dto::OptimizedLeg {
+                distance_km: l.distance_km,
+                duration_min: l.duration_secs as f64 / 60.0,
+                geometry: l.geometry,
+            })
+            .collect(),
+        distance_km: trip.distance_km,
+        duration_min: trip.duration_secs as f64 / 60.0,
+        geometry: trip.geometry,
+        departure: describe(dep, &s),
+        engine: "valhalla",
+    }))
+}
+
+/// `depart_at` wins; without it, `restricted` picks "any hour" or "now".
+fn departure(depart_at: Option<&str>, restricted: bool) -> AppResult<Departure> {
+    match depart_at.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|d| Departure::At(d.timestamp()))
+            .map_err(|e| AppError::BadRequest(format!("depart_at must be RFC 3339: {e}"))),
+        None if restricted => Ok(Departure::AnyHour),
+        None => Ok(Departure::At(chrono::Utc::now().timestamp())),
+    }
+}
+
+fn describe(dep: Departure, s: &AppState) -> String {
+    match dep {
+        Departure::AnyHour => "any_hour".into(),
+        Departure::At(ts) => chrono::DateTime::from_timestamp(ts, 0)
+            .map(|d| d.with_timezone(&s.cfg.timezone).format("%Y-%m-%dT%H:%M").to_string())
+            .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn departure_prefers_an_explicit_time() {
+        assert_eq!(departure(Some("2026-11-28T13:00:00+02:00"), true).unwrap(), Departure::At(1795863600));
+        assert_eq!(departure(None, true).unwrap(), Departure::AnyHour);
+        assert!(matches!(departure(Some("  "), true).unwrap(), Departure::AnyHour));
+        assert!(matches!(departure(None, false).unwrap(), Departure::At(_)));
+        assert!(departure(Some("tomorrow"), true).is_err());
+    }
 }

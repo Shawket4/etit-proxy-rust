@@ -270,10 +270,10 @@ impl HistoryService {
     ///
     /// Distance is the teleport-filtered chord sum over the raw pings —
     /// deliberately NOT map-matched: measured head-to-head, HMM matching a
-    /// full day costs up to ~30s of OSRM CPU on dense urban traces for a
+    /// full day costs up to ~30s of router CPU on dense urban traces for a
     /// ~0.3% distance difference (422.4 raw vs 423.5 matched km on the
     /// benchmark day), and interactive dashboard traffic doing that starves
-    /// the audit's OSRM. The nightly audit keeps road-snapped precision
+    /// the audit's router. The nightly audit keeps road-snapped precision
     /// where batch latency is free.
     pub async fn computed_summary(
         &self,

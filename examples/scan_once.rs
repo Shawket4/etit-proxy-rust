@@ -77,10 +77,14 @@ async fn main() -> anyhow::Result<()> {
         zones_repo: ZonesRepo::new(pool.clone()),
         trip_repo: TripAuditRepo::new(pool.clone()),
         apex_db,
-        osrm: etit_proxy::trips::osrm::OsrmClient::new(
-            http,
-            cfg.osrm_url.clone(),
-            cfg.osrm_exclude_class.clone(),
+        routing: etit_proxy::routing::RoutingClient::new(
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?,
+            cfg.valhalla_url.clone(),
+            cfg.truck.clone(),
+            cfg.timezone,
+            cfg.valhalla_time_bans.clone(),
         ),
         broadcaster: Broadcaster::new(8),
         started_at: Instant::now(),
