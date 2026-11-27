@@ -7,7 +7,8 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
-use crate::routing::Departure;
+use crate::routing::roads::compare;
+use crate::routing::{Departure, RoadDifference, RoadStretch, RoutingClient};
 use crate::state::AppState;
 use crate::trips::best_trip::{pick, whole_drive, MIN_SHARE};
 use crate::trips::geo::decode_polyline;
@@ -77,6 +78,9 @@ pub struct TruckRouteBody {
     pub geometry: String,
     /// Always "any_hour": legal whenever the truck leaves.
     pub departure: &'static str,
+    /// The major roads it takes, in order (see `routing::roads`); null when
+    /// Valhalla could not read them.
+    pub roads: Option<Vec<RoadStretch>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +93,9 @@ pub struct BestTripBody {
     pub arrive_ts: String,
     /// polyline5, map-matched by Valhalla from the truck's GPS.
     pub geometry: String,
+    /// The major roads it takes, in order; null when Valhalla could not
+    /// read them.
+    pub roads: Option<Vec<RoadStretch>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +112,9 @@ pub struct RoutesResponse {
     /// (GPS gaps, partial tracks); see best_trip.rs.
     pub set_aside: usize,
     pub min_share: f64,
+    /// What one route takes, road by road, that the other does not; null
+    /// unless both have a road list.
+    pub road_difference: Option<RoadDifference>,
 }
 
 /// `GET /service/trip-audit/routes?terminal=&drop_off=&from_lat=&from_lng=&to_lat=&to_lng=`
@@ -130,7 +140,7 @@ pub async fn routes(
         _ => return Err(AppError::BadRequest("send all four pin coordinates or none".into())),
     };
 
-    let truck = match pins {
+    let mut truck = match pins {
         None => None,
         Some((from, to)) => match s.routing.route(from, to, &[], Departure::AnyHour).await {
             Ok(r) => Some(TruckRouteBody {
@@ -138,6 +148,7 @@ pub async fn routes(
                 duration_min: round1(r.duration_secs as f64 / 60.0),
                 geometry: r.geometry,
                 departure: "any_hour",
+                roads: None,
             }),
             Err(e) => {
                 tracing::warn!(error = %e, %terminal, %drop_off, "truck route for the fee lookup failed");
@@ -175,9 +186,26 @@ pub async fn routes(
                 depart_ts: d.depart_ts,
                 arrive_ts: d.arrive_ts,
                 geometry: d.actual_geometry,
+                roads: None,
             });
             break 'pages;
         }
+    }
+
+    // Both road lists at once: a few hundred milliseconds each at most.
+    let (truck_roads, best_roads) = tokio::join!(
+        road_list(&s.routing, truck.as_ref().map(|t| t.geometry.as_str()), "truck route"),
+        road_list(&s.routing, best.as_ref().map(|b| b.geometry.as_str()), "best trip"),
+    );
+    let road_difference = match (&best_roads, &truck_roads) {
+        (Some(b), Some(t)) => Some(compare(b, t)),
+        _ => None,
+    };
+    if let Some(t) = truck.as_mut() {
+        t.roads = truck_roads;
+    }
+    if let Some(b) = best.as_mut() {
+        b.roads = best_roads;
     }
 
     Ok(Json(RoutesResponse {
@@ -188,7 +216,20 @@ pub async fn routes(
         trips_considered: choice.considered,
         set_aside,
         min_share: MIN_SHARE,
+        road_difference,
     }))
+}
+
+/// A route's major roads, or None (logged) when Valhalla cannot read them:
+/// the map still has the route.
+async fn road_list(routing: &RoutingClient, geometry: Option<&str>, which: &str) -> Option<Vec<RoadStretch>> {
+    match routing.roads(geometry?).await {
+        Ok(list) => Some(list),
+        Err(e) => {
+            tracing::warn!(error = %e, which, "road list for the fee lookup failed");
+            None
+        }
+    }
 }
 
 fn round1(x: f64) -> f64 {
@@ -214,6 +255,29 @@ mod tests {
             required(Some(" Tanta ".into()), "drop_off").unwrap(),
             "Tanta"
         );
+    }
+
+    #[test]
+    fn routes_carry_road_lists_and_their_difference_as_null_when_absent() {
+        let body = RoutesResponse {
+            terminal: "Somed".into(),
+            drop_off: "Qena".into(),
+            truck_route: Some(TruckRouteBody {
+                distance_km: 695.4,
+                duration_min: 505.7,
+                geometry: "g".into(),
+                departure: "any_hour",
+                roads: None,
+            }),
+            best_trip: None,
+            trips_considered: 0,
+            set_aside: 0,
+            min_share: MIN_SHARE,
+            road_difference: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v["truck_route"].get("roads").is_some_and(|x| x.is_null()));
+        assert!(v.get("road_difference").is_some_and(|x| x.is_null()));
     }
 
     #[test]

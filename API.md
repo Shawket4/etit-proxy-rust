@@ -403,14 +403,72 @@ Two drives of one route for the fee lookup's map, both on the road network:
 
 The pins are optional, but send all four or none (`400` otherwise).
 
+**`roads`** (on both routes): the major roads the route takes, in driving
+order, for a turn-by-turn-like list (`src/routing/roads.rs`). Valhalla's
+`trace_attributes` walks the route's own shape edge by edge (`map_snap` if
+the walk breaks), and one code path summarises both routes:
+
+- consecutive edges of one road join: the same name (Arabic spelling
+  variants folded), or a shared ref where one side has no name. Differently
+  named sections of one ref stay apart (the coast road 11 is four sections);
+- ramps, turn channels, roundabouts and junctions, and any stretch shorter
+  than 2% of the route (at least 3 km, at most 10 km), are folded into the
+  road before them, or after them at the very start; their km go with them,
+  so the list adds up to the route;
+- local streets (residential, unclassified, service) form one stretch when
+  long enough, with `name` and `ref` null.
+
+Each stretch:
+
+| field | |
+|---|---|
+| `name` | OSM name as mapped (Arabic in Egypt; this Valhalla build serves no `name:en`). `null` for an unnamed road and for local streets |
+| `ref` | road number (`"11"`, `"244"`), or `null` |
+| `road_class` | Valhalla's class for most of the stretch: `motorway`, `trunk`, `primary`, `secondary`, `tertiary`, `unclassified`, `residential`, `service_other` |
+| `km` | including what it absorbed |
+| `from_index`, `to_index` | first and last vertex of the route's `geometry` on this stretch; the next stretch starts on this one's last vertex, the first starts at 0 and the last ends on the last vertex |
+
+`roads` is `null` when Valhalla could not read the route (the route itself is
+still sent).
+
+**`road_difference`**: what each route drives much more of than the other,
+road by road. A road is every stretch, on either route, sharing a ref or a
+name; unnamed roads and local streets cannot be matched and are left out.
+"Much more" is at least 3 km and a quarter of the road's longer share.
+`best_more` / `truck_more` are sorted by the extra km; each entry has
+`name` (`null` for a numbered road whose sections carry several names),
+`ref`, `best_km` and `truck_km`. `null` unless both routes have `roads`.
+
 ```jsonc
 {
   "terminal": "Somed", "drop_off": "Qena",
-  "truck_route": { "distance_km": 548.2, "duration_min": 410.5,
-                   "geometry": "<polyline5>", "departure": "any_hour" },
-  "best_trip":   { "km": 535.8, "drive_min": 452.0,   // geofence exit to entry, stops included
-                   "day": "2026-10-12", "depart_ts": "2026-10-12T03:10:00Z",
-                   "arrive_ts": "2026-10-12T10:42:00Z", "geometry": "<polyline5>" },
-  "trips_considered": 565, "set_aside": 5, "min_share": 0.8
+  "truck_route": { "distance_km": 695.4, "duration_min": 505.7,
+                   "geometry": "<polyline5>", "departure": "any_hour",
+                   "roads": [
+                     { "name": "طريق السويس, العين السخنه الجانبي", "ref": "11", "road_class": "primary",
+                       "km": 18.2, "from_index": 0, "to_index": 282 },
+                     { "name": "طريق العين السخنه", "ref": null, "road_class": "trunk",
+                       "km": 36.9, "from_index": 282, "to_index": 882 },
+                     // …
+                     { "name": "طريق اسيوط, قنا الزراعي", "ref": "25", "road_class": "trunk",
+                       "km": 144.9, "from_index": 6142, "to_index": 8030 } ] },
+  "best_trip":   { "km": 541.4, "drive_min": 1568.1,   // geofence exit to entry, stops included
+                   "day": "2026-11-04", "depart_ts": "2026-11-04T14:32:55Z",
+                   "arrive_ts": "2026-11-05T16:41:03Z", "geometry": "<polyline5>",
+                   "roads": [
+                     { "name": "طريق العين السخنه, الزعفرانه", "ref": "11", "road_class": "trunk",
+                       "km": 65.8, "from_index": 0, "to_index": 1127 },
+                     // … two more sections of 11 …
+                     { "name": "طريق الغردقة, سفاجا", "ref": "11", "road_class": "trunk",
+                       "km": 54.2, "from_index": 2684, "to_index": 3221 },
+                     { "name": "طريق قنا, سفاجا", "ref": "244", "road_class": "trunk",
+                       "km": 168.3, "from_index": 3221, "to_index": 6019 } ] },
+  "trips_considered": 583, "set_aside": 199, "min_share": 0.8,
+  "road_difference": {
+    "best_more":  [ { "name": null, "ref": "11", "best_km": 373.7, "truck_km": 18.2 },
+                    { "name": "طريق قنا, سفاجا", "ref": "244", "best_km": 168.3, "truck_km": 0.0 } ],
+    "truck_more": [ { "name": "طريق اسيوط, قنا الزراعي", "ref": "25", "best_km": 0.0, "truck_km": 144.9 },
+                    { "name": "طريق المنيا, الواسطى", "ref": null, "best_km": 0.0, "truck_km": 127.6 } ]
+  }
 }
 ```

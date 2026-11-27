@@ -8,6 +8,8 @@
 //!   matching that returns the OSM ways driven, and distance matrices.
 //! - [`bans`]     — the roads closed to the fleet, built into the tiles, by
 //!   way id, so a matched trace can be checked against them.
+//! - [`roads`]    — the major roads a route takes, in order, for the fee
+//!   lookup's list (read from Valhalla's edges by the client).
 //!
 //! Closed roads are data, not request flags: `valhalla/build.sh` writes them
 //! into the map (`hgv=no` when closed at every hour, `hgv:conditional` when
@@ -15,9 +17,11 @@
 //! Valhalla applies them itself.
 
 pub mod bans;
+pub mod roads;
 pub mod valhalla;
 
 pub use bans::{Ban, TimeBans};
+pub use roads::{RoadDifference, RoadStretch};
 pub use valhalla::{Departure, MatchedTrace, OptimizedTrip, Route, RoutingClient};
 
 /// The vehicle every route is planned for. Defaults are Apex's 40 t fuel
