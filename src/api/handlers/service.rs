@@ -9,7 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::routing::Departure;
 use crate::state::AppState;
-use crate::trips::best_trip::{pick, MIN_SHARE};
+use crate::trips::best_trip::{pick, whole_drive, MIN_SHARE};
+use crate::trips::geo::decode_polyline;
+
+/// Shapes read per query, and the most pages one request reads (1,000
+/// shapes, ~15 MB of polyline at the long end) looking for a whole drive.
+const SHAPE_PAGE: usize = 50;
+const MAX_SHAPE_PAGES: usize = 20;
 use crate::trips::driven::{summarise, DrivenSummary};
 
 #[derive(Deserialize)]
@@ -95,7 +101,8 @@ pub struct RoutesResponse {
     pub best_trip: Option<BestTripBody>,
     /// Road-matched trips with a shape on this route.
     pub trips_considered: usize,
-    /// Of those, readings too short to be real (GPS gaps); see best_trip.rs.
+    /// Readings shorter than the best trip that are not the whole route
+    /// (GPS gaps, partial tracks); see best_trip.rs.
     pub set_aside: usize,
     pub min_share: f64,
 }
@@ -145,22 +152,33 @@ pub async fn routes(
         .await
         .map_err(AppError::Internal)?;
     let choice = pick(&candidates, truck.as_ref().map(|t| t.distance_km));
-    let best = match choice.best {
-        None => None,
-        Some(c) => s
-            .trip_repo
-            .leg_drive(c.id)
-            .await
-            .map_err(AppError::Internal)?
-            .map(|d| BestTripBody {
+
+    // From the shortest up, the first whole drive (see best_trip.rs). On a
+    // route through a coverage hole most trips carry a gap: Somed -> Qena's
+    // first whole drive was its ~115th shortest reading. Shapes are read a
+    // page at a time and the walk stops at the first whole one.
+    let mut set_aside = choice.below_floor;
+    let mut best = None;
+    'pages: for page in choice.ordered.chunks(SHAPE_PAGE).take(MAX_SHAPE_PAGES) {
+        let ids: Vec<i64> = page.iter().map(|c| c.id).collect();
+        let mut drives = s.trip_repo.leg_drives(&ids).await.map_err(AppError::Internal)?;
+        for c in page {
+            let Some(d) = drives.remove(&c.id) else { continue };
+            if whole_drive(&decode_polyline(&d.actual_geometry), pins).is_err() {
+                set_aside += 1;
+                continue;
+            }
+            best = Some(BestTripBody {
                 km: round1(d.actual_km),
                 drive_min: round1(d.actual_secs as f64 / 60.0),
                 day: d.day_local,
                 depart_ts: d.depart_ts,
                 arrive_ts: d.arrive_ts,
                 geometry: d.actual_geometry,
-            }),
-    };
+            });
+            break 'pages;
+        }
+    }
 
     Ok(Json(RoutesResponse {
         terminal,
@@ -168,7 +186,7 @@ pub async fn routes(
         truck_route: truck,
         best_trip: best,
         trips_considered: choice.considered,
-        set_aside: choice.set_aside,
+        set_aside,
         min_share: MIN_SHARE,
     }))
 }
