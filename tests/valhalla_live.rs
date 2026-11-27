@@ -155,3 +155,39 @@ async fn matrix_and_optimizer_answer_for_several_drops() {
     let parts: usize = trip.legs.iter().map(|l| etit_proxy::trips::geo::decode_polyline(&l.geometry).len()).sum();
     assert!(whole.len() > 100 && whole.len() <= parts, "whole-trip shape joins the legs: {} vs {parts}", whole.len());
 }
+
+const SOMED: (f64, f64) = (29.594416, 32.329073);
+const QENA: (f64, f64) = (26.178375, 32.686582);
+
+/// The fee lookup's road list, on the busiest route: a handful of major
+/// roads that add up to the route and tile its geometry, and the same roads
+/// again when the route is driven and map-matched like a real trip.
+#[tokio::test]
+async fn a_long_route_reads_as_a_few_major_roads_driven_or_routed() {
+    let Some(c) = client() else { return };
+    let r = c.route(SOMED, QENA, &[], Departure::AnyHour).await.unwrap();
+    let roads = c.roads(&r.geometry).await.unwrap();
+    for s in &roads {
+        println!("{:6.1} km  {:?} [{:?}] ({}) {}-{}", s.km, s.name, s.road_ref, s.road_class, s.from_index, s.to_index);
+    }
+    let n = etit_proxy::trips::geo::decode_polyline(&r.geometry).len();
+    assert!((2..=20).contains(&roads.len()), "{} stretches", roads.len());
+    let total: f64 = roads.iter().map(|s| s.km).sum();
+    assert!((total - r.distance_km).abs() < 2.0, "{total:.1} km listed for a {:.1} km route", r.distance_km);
+    assert_eq!((roads[0].from_index, roads.last().unwrap().to_index), (0, n - 1));
+    for w in roads.windows(2) {
+        assert_eq!(w[0].to_index, w[1].from_index);
+        assert!(w[0].from_index < w[0].to_index);
+    }
+    assert!(roads.iter().all(|s| s.km >= 3.0), "short pieces are folded in");
+    // Into Qena on the Assiut–Qena road (inland) or Qena–Safaga (the coast).
+    let last = roads.last().unwrap().road_ref.as_deref();
+    assert!(matches!(last, Some("25") | Some("244")), "{last:?}");
+
+    // Driven: GPS fixes along it, map-matched as the audit matches trips.
+    let matched = c.match_trace(&timed(&as_fixes(&r.geometry), cairo(3, 0))).await.unwrap();
+    let driven = c.roads(&matched.geometries[0]).await.unwrap();
+    let d = etit_proxy::routing::roads::compare(&driven, &roads);
+    println!("{d:?}");
+    assert!(d.best_more.is_empty() && d.truck_more.is_empty(), "the same drive reads as the same roads: {d:?}");
+}

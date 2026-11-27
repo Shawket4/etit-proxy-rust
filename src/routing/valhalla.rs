@@ -12,6 +12,9 @@
 //!   when, which is what lets the audit check them against the bans.
 //! - [`RoutingClient::matrix`]: one call for every pairwise distance, for the
 //!   best-drop-order check.
+//! - [`RoutingClient::roads`]: the major roads a route already on the map
+//!   takes, in order (`trace_attributes` on its own shape, summarised by
+//!   [`super::roads`]).
 //!
 //! Valhalla returns precision-6 shapes. Everything leaving this module is
 //! precision 5, the format this service has always stored and served.
@@ -27,8 +30,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::bans::TimeBans;
+use super::roads::{self, RoadEdge, RoadStretch};
 use super::Truck;
-use crate::trips::geo::decode_polyline6;
+use crate::trips::geo::{decode_polyline, decode_polyline6};
 use crate::trips::matcher::encode_track;
 use crate::zones::geo::haversine_m;
 
@@ -331,6 +335,63 @@ impl RoutingClient {
             .await?;
         parse_trace(&v, points)
     }
+
+    /// The major roads a polyline5 route on the road network takes, in
+    /// driving order, with vertex ranges into that same polyline (see
+    /// [`super::roads`]). Used for Valhalla's truck route and for a trip's
+    /// map-matched shape alike.
+    ///
+    /// `trace_attributes` walks the shape edge by edge (`edge_walk`): it is
+    /// already on the roads, so the walk is exact and takes milliseconds.
+    /// A matched trip can carry a short straight chord across a GPS gap,
+    /// which breaks the walk; then the shape is map-snapped instead. Costing
+    /// ignores access and closures like [`Self::match_trace`]: a trip on a
+    /// banned road still has a road name.
+    pub async fn roads(&self, geometry: &str) -> Result<Vec<RoadStretch>> {
+        let served = decode_polyline(geometry);
+        if served.len() < 2 {
+            return Err(anyhow!("route shape too short for a road list"));
+        }
+        let body = |shape_match: &str| {
+            json!({
+                "encoded_polyline": encode_polyline6(&served),
+                "costing": "auto",
+                "costing_options": { "auto": {
+                    "ignore_access": true,
+                    "ignore_restrictions": true,
+                    "ignore_closures": true,
+                }},
+                "shape_match": shape_match,
+                "units": "kilometers",
+                "filters": {
+                    "attributes": [
+                        "edge.names", "edge.length", "edge.road_class", "edge.use",
+                        "edge.roundabout", "edge.internal_intersection",
+                        "edge.begin_shape_index", "edge.end_shape_index", "shape",
+                    ],
+                    "action": "include",
+                },
+            })
+        };
+        let v = match self.post("trace_attributes", &body("edge_walk")).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "edge walk failed; map-snapping the route for its roads");
+                self.post("trace_attributes", &body("map_snap")).await?
+            }
+        };
+        let (edges, trace) = parse_road_edges(&v)?;
+        let mut stretches = roads::summarise(&edges);
+        roads::reindex(&mut stretches, &trace, &served);
+        Ok(stretches)
+    }
+}
+
+/// Valhalla reads `encoded_polyline` at precision 6. The precision-5 encoder
+/// writes precision 6 for coordinates scaled by ten.
+fn encode_polyline6(points: &[(f64, f64)]) -> String {
+    let scaled: Vec<(f64, f64)> = points.iter().map(|(a, b)| (a * 10.0, b * 10.0)).collect();
+    encode_track(&scaled)
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -534,6 +595,59 @@ pub(crate) fn parse_trace(v: &Value, input: &[(f64, f64, i64)]) -> Result<Matche
     })
 }
 
+#[derive(Deserialize)]
+struct RoadTrace {
+    #[serde(default)]
+    edges: Vec<RoadTraceEdge>,
+    #[serde(default)]
+    shape: String,
+}
+
+#[derive(Deserialize)]
+struct RoadTraceEdge {
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    length: f64,
+    #[serde(default)]
+    road_class: String,
+    #[serde(rename = "use", default)]
+    road_use: String,
+    #[serde(default)]
+    roundabout: bool,
+    #[serde(default)]
+    internal_intersection: bool,
+    #[serde(default)]
+    begin_shape_index: usize,
+    #[serde(default)]
+    end_shape_index: usize,
+}
+
+/// The edges of a traced route and the traced shape their vertex indices
+/// refer to.
+type TracedRoads = (Vec<RoadEdge>, Vec<(f64, f64)>);
+
+pub(crate) fn parse_road_edges(v: &Value) -> Result<TracedRoads> {
+    let r: RoadTrace = serde_json::from_value(v.clone()).context("Valhalla trace_attributes: unexpected answer")?;
+    if r.edges.is_empty() {
+        return Err(anyhow!("Valhalla trace_attributes: no edges on the route"));
+    }
+    let edges = r
+        .edges
+        .into_iter()
+        .map(|e| RoadEdge {
+            names: e.names,
+            road_class: e.road_class,
+            road_use: if e.road_use.is_empty() { "road".into() } else { e.road_use },
+            junction: e.roundabout || e.internal_intersection,
+            km: e.length,
+            begin: e.begin_shape_index,
+            end: e.end_shape_index,
+        })
+        .collect();
+    Ok((edges, decode_polyline6(&r.shape)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +658,64 @@ mod tests {
     const TRACE: &str = r#"{"edges":[{"way_id":376242789,"length":0.023,"names":["شارع شجره الدر"]},{"way_id":24987129,"length":0.091,"names":["شارع ابن زنكي"]},{"way_id":25055007,"length":0.062,"names":["شارع 26 يوليو"]},{"way_id":324407510,"length":0.013}],
         "matched_points":[{"lon":31.218319,"lat":30.060575,"type":"matched","edge_index":0},{"lon":31.210959,"lat":30.059198,"type":"matched","edge_index":2},{"lon":31.203,"lat":30.0571,"type":"unmatched"}],
         "shape":"_awix@_hlpz@zJtEyBnGyRbk@oTtv@gH`Ayg@`IkGhBac@bHWD`E|CNrGb@nG`AvMvAzMxB~QTtKwIdRb@pClF}@vAWpKiBdEs@dD`BlC`CnBdDlAzDj@bFf@dEHlA~AbXtEtDzBl@`CJ~BEfa@oG`I|p@b@nD~Era@l[kErBo@lCPlCWlBrO`BjZr^qFJfBfEdh@"}"#;
+
+    // A real edge walk (Valhalla 3.9.3, Egypt tiles) of 8.7 km of a matched
+    // trip: off the Regional Ring Road by a ramp, through a roundabout, onto
+    // Ismailia Road. Its shape has one vertex more than the route it walked.
+    const ROADS_TRACE: &str = r#"{"edges":[
+        {"names":["515","الطريق الدائري الإقليمي"],"length":1.99,"road_class":"motorway","use":"road","begin_shape_index":0,"end_shape_index":2},
+        {"names":["515","الطريق الدائري الإقليمي"],"length":0.638,"road_class":"motorway","use":"road","begin_shape_index":2,"end_shape_index":5},
+        {"names":["515","الطريق الدائري الإقليمي"],"length":2.003,"road_class":"motorway","use":"road","begin_shape_index":5,"end_shape_index":9},
+        {"length":0.75,"road_class":"primary","use":"ramp","begin_shape_index":9,"end_shape_index":35},
+        {"length":0.857,"road_class":"primary","use":"road","begin_shape_index":35,"end_shape_index":37},
+        {"length":0.073,"road_class":"primary","use":"road","begin_shape_index":37,"end_shape_index":39},
+        {"length":0.091,"road_class":"primary","use":"road","begin_shape_index":39,"end_shape_index":40},
+        {"length":0.849,"road_class":"primary","use":"road","begin_shape_index":40,"end_shape_index":42},
+        {"length":0.418,"road_class":"primary","use":"road","begin_shape_index":42,"end_shape_index":43},
+        {"length":0.24,"road_class":"primary","use":"road","begin_shape_index":43,"end_shape_index":49},
+        {"length":0.015,"road_class":"primary","use":"road","roundabout":true,"begin_shape_index":49,"end_shape_index":50},
+        {"length":0.137,"road_class":"primary","use":"road","roundabout":true,"begin_shape_index":50,"end_shape_index":56},
+        {"length":0.017,"road_class":"primary","use":"road","roundabout":true,"begin_shape_index":56,"end_shape_index":57},
+        {"names":["طريق الإسماعيلية"],"length":0.086,"road_class":"primary","use":"road","begin_shape_index":57,"end_shape_index":60},
+        {"names":["طريق الإسماعيلية"],"length":0.059,"road_class":"primary","use":"road","begin_shape_index":60,"end_shape_index":61},
+        {"names":["طريق الإسماعيلية"],"length":0.103,"road_class":"primary","use":"road","begin_shape_index":61,"end_shape_index":62},
+        {"names":["طريق الإسماعيلية"],"length":0.157,"road_class":"primary","use":"road","begin_shape_index":62,"end_shape_index":63},
+        {"names":["طريق الإسماعيلية"],"length":0.054,"road_class":"primary","use":"road","begin_shape_index":63,"end_shape_index":64},
+        {"names":["طريق الإسماعيلية"],"length":0.101,"road_class":"primary","use":"road","begin_shape_index":64,"end_shape_index":65},
+        {"names":["طريق الإسماعيلية"],"length":0.043,"road_class":"primary","use":"road","begin_shape_index":65,"end_shape_index":66},
+        {"names":["طريق الإسماعيلية"],"length":0.024,"road_class":"primary","use":"road","begin_shape_index":66,"end_shape_index":67}
+        ],"shape":"k}mqx@}hso{@C@anZd}Wm`BnwAwnAdgAehBv}A}yKhqJchF~mEshF|nE}JrIgZbQyRtLqSvN_T`PsQlNaKzGkH`DqGxBoGdA{Wh@cMmBaI_CgJyD{MwIsNsHyHuB_LgA{OPaEd@cPxE}V`JsDj@aH~@kKNcQeA_PyCwA_CugHonLoKeQwK_Rg]wn@wtDqkGmsBs`D_rCsrE{Uy_@}IoPgHoPqGsTkEsUiCiVd@qHSyMkBiMaE_LkGeJkIwGuJ}DeHgAcWgNeHyEcGiEqYyUkc@gs@yu@coAqR{Y{b@cr@gNaUuGuK"}"#;
+    /// The route that trace was made from: 67 vertices, polyline5.
+    const ROADS_ROUTE: &str = r#"s{fwDkft`E}vAxnAwHxG}FfFqInHah@~c@iVtSkVxSe@`@wAx@}@j@aAp@cAt@{@p@e@Z]N[JYFoABm@I_@Mc@Qo@a@q@_@]Ki@Eu@@SBu@RmAb@QB[Fg@?y@Eu@OGKu\ej@g@y@i@{@_ByCeQyYsJeOuMcTiAiBa@w@]w@[eASgAMiAB]Ao@Im@Si@[c@_@[e@Q]GkAo@]UYSsAiAuBeDmD_G_AuAqBcDo@gA[g@"#;
+
+    #[test]
+    fn a_route_walk_reads_its_roads_onto_the_route_vertices() {
+        let (edges, trace) = parse_road_edges(&serde_json::from_str(ROADS_TRACE).unwrap()).unwrap();
+        assert_eq!(edges.len(), 21);
+        assert_eq!((edges[3].road_use.as_str(), edges[3].names.len()), ("ramp", 0));
+        assert!(edges[10].junction, "a roundabout is a junction");
+        let served = decode_polyline(ROADS_ROUTE);
+        assert_eq!((trace.len(), served.len()), (68, 67));
+
+        let mut s = roads::summarise(&edges);
+        roads::reindex(&mut s, &trace, &served);
+        let got: Vec<(Option<&str>, Option<&str>, f64)> =
+            s.iter().map(|x| (x.name.as_deref(), x.road_ref.as_deref(), x.km)).collect();
+        // The ramp joins the ring road; Ismailia Road is under the 3 km
+        // floor and folds into the unnamed road it follows.
+        assert_eq!(got, vec![(Some("الطريق الدائري الإقليمي"), Some("515"), 5.4), (None, None, 3.3)]);
+        assert_eq!((s[0].from_index, s[1].to_index), (0, 66));
+        // The ring road ends where the ramp does, on the route's own vertex.
+        let end = served[s[0].to_index];
+        let ramp_end = trace[35];
+        assert!(crate::zones::geo::haversine_m(end.0, end.1, ramp_end.0, ramp_end.1) < 5.0);
+        assert_eq!(s[0].to_index, s[1].from_index);
+    }
+
+    #[test]
+    fn a_route_with_no_edges_has_no_road_list() {
+        assert!(parse_road_edges(&json!({"edges": [], "shape": ""})).is_err());
+    }
 
     #[test]
     fn a_route_reads_its_summary_and_comes_out_as_polyline5() {
@@ -674,6 +846,54 @@ mod tests {
 
         let err = client.match_trace(&[(30.0, 31.0, 0), (30.1, 31.1, 60)]).await.unwrap_err().to_string();
         assert!(err.contains("443") && err.contains("failed to find path"), "{err}");
+    }
+
+    /// The edge walk breaks on a matched trip's GPS-gap chord; the client then
+    /// map-snaps the same shape, and both requests are precision 6.
+    #[tokio::test]
+    async fn roads_fall_back_to_map_snap_when_the_walk_breaks() {
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let app = axum::Router::new().route(
+            "/trace_attributes",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let s2 = s2.clone();
+                async move {
+                    let walk = body["shape_match"] == "edge_walk";
+                    s2.lock().unwrap().push(body);
+                    if walk {
+                        (
+                            axum::http::StatusCode::BAD_REQUEST,
+                            axum::Json(json!({"error_code": 443, "error": "Exact route match algorithm failed to find path"})),
+                        )
+                    } else {
+                        (axum::http::StatusCode::OK, axum::Json(serde_json::from_str::<Value>(ROADS_TRACE).unwrap()))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = RoutingClient::new(reqwest::Client::new(), format!("http://{addr}"), Truck::default(), chrono_tz::Africa::Cairo, None);
+        let s = client.roads(ROADS_ROUTE).await.unwrap();
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].road_ref.as_deref(), Some("515"));
+
+        let bodies = seen.lock().unwrap().clone();
+        let tries: Vec<&str> = bodies.iter().map(|b| b["shape_match"].as_str().unwrap()).collect();
+        assert_eq!(tries, vec!["edge_walk", "map_snap"]);
+        let sent = decode_polyline6(bodies[0]["encoded_polyline"].as_str().unwrap());
+        let served = decode_polyline(ROADS_ROUTE);
+        assert_eq!(sent.len(), served.len());
+        assert!((sent[10].0 - served[10].0).abs() < 1e-9 && (sent[10].1 - served[10].1).abs() < 1e-9);
+        assert_eq!(bodies[0]["costing_options"]["auto"]["ignore_closures"], true);
+
+        assert!(client.roads("").await.is_err(), "no shape, no list");
     }
 
     #[tokio::test]
