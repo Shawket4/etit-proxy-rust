@@ -77,6 +77,7 @@ pub fn router(state: AppState) -> Router {
     let service_state = state.clone();
     let service = Router::new()
         .route("/trip-audit/driven-km", get(handlers::service::driven_km))
+        .route("/trip-audit/routes",    get(handlers::service::routes))
         .layer(from_fn_with_state(service_state, middleware::service_guard));
 
     Router::new()

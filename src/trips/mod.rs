@@ -13,9 +13,11 @@
 //! - [`matcher`]   — geofence-based trip reconstruction and metrics
 //! - [`calibrate`] — GPS stop clustering → pin suggestions
 //! - [`driven`]    — driven km per terminal → drop-off, for the fee lookup
+//! - [`best_trip`] — the shortest real drive of a route, GPS gaps set aside
 //! - [`scan`]      — orchestration + nightly scheduler
 
 pub mod bans_check;
+pub mod best_trip;
 pub mod calibrate;
 pub mod driven;
 pub mod drop_order;
